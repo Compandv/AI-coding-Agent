@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from mewcode.prompts import PromptPayload
 from mewcode.session import Message
 
 
@@ -16,10 +17,22 @@ class ToolCall:
 
 
 @dataclass
+class ProviderUsage:
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read_input_tokens: int | None = None
+    cache_creation_input_tokens: int | None = None
+    cached_tokens: int | None = None
+    provider: str = ""
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class ChatResponse:
     text: str
     tool_call: ToolCall | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)
+    usage: ProviderUsage | None = None
 
     def __post_init__(self) -> None:
         if self.tool_call is not None and not self.tool_calls:
@@ -35,6 +48,7 @@ class StreamChunk:
     text: str = ""
     tool_call: ToolCall | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)
+    usage: ProviderUsage | None = None
 
     def __post_init__(self) -> None:
         if self.tool_call is not None and not self.tool_calls:
@@ -45,15 +59,17 @@ class StreamChunk:
 
 class ChatProvider(ABC):
     @abstractmethod
-    def stream_chat(self, messages: list[Message]) -> Iterator[str]:
+    def stream_chat(self, messages: list[Message] | PromptPayload) -> Iterator[str]:
         """Yield text deltas for a chat response."""
 
     @abstractmethod
-    def complete_chat(self, messages: list[Message], tools: list[dict[str, Any]] | None = None) -> ChatResponse:
+    def complete_chat(
+        self, messages: list[Message] | PromptPayload, tools: list[dict[str, Any]] | None = None
+    ) -> ChatResponse:
         """Return either a final text response or a single tool call."""
 
     def stream_response(
-        self, messages: list[Message], tools: list[dict[str, Any]] | None = None
+        self, messages: list[Message] | PromptPayload, tools: list[dict[str, Any]] | None = None
     ) -> Iterator[StreamChunk]:
         """Yield text deltas as they arrive, then a tool call if one was requested.
 

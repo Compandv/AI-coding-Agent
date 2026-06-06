@@ -7,9 +7,10 @@ from typing import Any
 import httpx
 
 from mewcode.config import MewCodeConfig
+from mewcode.prompts import PromptPayload
 from mewcode.session import Message
 
-from .base import ChatProvider, ChatResponse, StreamChunk, ToolCall
+from .base import ChatProvider, ChatResponse, ProviderUsage, StreamChunk, ToolCall
 from .errors import ProviderError
 from .sse import SSEClientMixin
 
@@ -61,11 +62,13 @@ class OpenAIProvider(SSEClientMixin, ChatProvider):
         self.config = config
         self.client = client or httpx.Client(timeout=config.timeout_seconds)
 
-    def stream_chat(self, messages: list[Message]) -> Iterator[str]:
+    def stream_chat(self, messages: list[Message] | PromptPayload) -> Iterator[str]:
+        prompt = self._prompt_payload(messages, tools=None)
         payload = {
             "model": self.config.model,
-            "messages": self._messages_payload(messages),
+            "messages": self._messages_payload(prompt),
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if "max_tokens" in self.config.extra:
             payload["max_tokens"] = self.config.extra["max_tokens"]
@@ -87,12 +90,15 @@ class OpenAIProvider(SSEClientMixin, ChatProvider):
         except httpx.HTTPError as exc:
             raise ProviderError(f"Network or connection failed: {exc}") from exc
 
-    def complete_chat(self, messages: list[Message], tools: list[dict[str, Any]] | None = None) -> ChatResponse:
-        if tools:
-            return self._complete_chat_with_tools_stream(messages, tools)
+    def complete_chat(
+        self, messages: list[Message] | PromptPayload, tools: list[dict[str, Any]] | None = None
+    ) -> ChatResponse:
+        prompt = self._prompt_payload(messages, tools=tools)
+        if prompt.tools:
+            return self._complete_chat_with_tools_stream(prompt, prompt.tools)
         payload: dict[str, Any] = {
             "model": self.config.model,
-            "messages": self._messages_payload(messages),
+            "messages": self._messages_payload(prompt),
             "stream": False,
         }
         if "max_tokens" in self.config.extra:
@@ -113,23 +119,52 @@ class OpenAIProvider(SSEClientMixin, ChatProvider):
         data = response.json()
         choices = data.get("choices") or []
         if not choices:
-            return ChatResponse(text="")
+            return ChatResponse(text="", usage=self._usage_from_response(data))
         message = choices[0].get("message") or {}
-        return ChatResponse(text=str(message.get("content") or ""))
+        return ChatResponse(text=str(message.get("content") or ""), usage=self._usage_from_response(data))
 
     def stream_response(
-        self, messages: list[Message], tools: list[dict[str, Any]] | None = None
+        self, messages: list[Message] | PromptPayload, tools: list[dict[str, Any]] | None = None
     ) -> Iterator[StreamChunk]:
-        if not tools:
-            for text in self.stream_chat(messages):
-                yield StreamChunk(text=text)
+        prompt = self._prompt_payload(messages, tools=tools)
+        if not prompt.tools:
+            payload: dict[str, Any] = {
+                "model": self.config.model,
+                "messages": self._messages_payload(prompt),
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            }
+            if "max_tokens" in self.config.extra:
+                payload["max_tokens"] = self.config.extra["max_tokens"]
+
+            headers = {
+                "authorization": f"Bearer {self.config.api_key}",
+                "content-type": "application/json",
+                "accept": "text/event-stream",
+            }
+            url = f"{self.config.base_url}/chat/completions"
+            events: list[dict[str, Any]] = []
+            try:
+                with self.client.stream("POST", url, headers=headers, json=payload) as response:
+                    self._raise_for_status(response)
+                    for event in self._iter_sse_json(response):
+                        events.append(event)
+                        text = self._text_delta(event)
+                        if text:
+                            yield StreamChunk(text=text)
+            except httpx.HTTPError as exc:
+                raise ProviderError(f"Network or connection failed: {exc}") from exc
+            usage = self._usage_from_events(events)
+            if usage is not None:
+                yield StreamChunk(usage=usage)
             return
 
         payload: dict[str, Any] = {
             "model": self.config.model,
-            "messages": self._messages_payload(messages),
+            "messages": self._messages_payload(prompt),
             "stream": True,
-            "tools": self._tools_payload(tools),
+            "stream_options": {"include_usage": True},
+            "tools": self._tools_payload(prompt.tools),
         }
         if "max_tokens" in self.config.extra:
             payload["max_tokens"] = self.config.extra["max_tokens"]
@@ -154,15 +189,22 @@ class OpenAIProvider(SSEClientMixin, ChatProvider):
             raise ProviderError(f"Network or connection failed: {exc}") from exc
 
         tool_calls = parse_openai_tool_calls_stream(events)
+        usage = self._usage_from_events(events)
         if tool_calls:
-            yield StreamChunk(tool_calls=tool_calls)
+            yield StreamChunk(tool_calls=tool_calls, usage=usage)
+        elif usage is not None:
+            yield StreamChunk(usage=usage)
 
-    def _complete_chat_with_tools_stream(self, messages: list[Message], tools: list[dict[str, Any]]) -> ChatResponse:
+    def _complete_chat_with_tools_stream(
+        self, messages: list[Message] | PromptPayload, tools: list[dict[str, Any]]
+    ) -> ChatResponse:
+        prompt = self._prompt_payload(messages, tools=tools)
         payload: dict[str, Any] = {
             "model": self.config.model,
-            "messages": self._messages_payload(messages),
+            "messages": self._messages_payload(prompt),
             "stream": True,
-            "tools": self._tools_payload(tools),
+            "stream_options": {"include_usage": True},
+            "tools": self._tools_payload(prompt.tools),
         }
         if "max_tokens" in self.config.extra:
             payload["max_tokens"] = self.config.extra["max_tokens"]
@@ -188,9 +230,17 @@ class OpenAIProvider(SSEClientMixin, ChatProvider):
             raise ProviderError(f"Network or connection failed: {exc}") from exc
 
         tool_calls = parse_openai_tool_calls_stream(events)
+        usage = self._usage_from_events(events)
         if tool_calls:
-            return ChatResponse(text="", tool_calls=tool_calls)
-        return ChatResponse(text="".join(text_parts))
+            return ChatResponse(text="", tool_calls=tool_calls, usage=usage)
+        return ChatResponse(text="".join(text_parts), usage=usage)
+
+    def _prompt_payload(
+        self, messages: list[Message] | PromptPayload, tools: list[dict[str, Any]] | None
+    ) -> PromptPayload:
+        if isinstance(messages, PromptPayload):
+            return messages
+        return PromptPayload(system="", messages=messages, tools=tools or [])
 
     def _tools_payload(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         payload: list[dict[str, Any]] = []
@@ -203,9 +253,11 @@ class OpenAIProvider(SSEClientMixin, ChatProvider):
             payload.append({"type": "function", "function": function})
         return payload
 
-    def _messages_payload(self, messages: list[Message]) -> list[dict[str, Any]]:
+    def _messages_payload(self, prompt: PromptPayload) -> list[dict[str, Any]]:
         payload = []
-        for message in messages:
+        if prompt.system:
+            payload.append({"role": "system", "content": prompt.system})
+        for message in prompt.messages:
             role = message["role"]
             if role == "tool":
                 payload.append(
@@ -259,6 +311,28 @@ class OpenAIProvider(SSEClientMixin, ChatProvider):
         delta = choices[0].get("delta") or {}
         return str(delta.get("content") or "")
 
+    def _usage_from_events(self, events: list[dict[str, Any]]) -> ProviderUsage | None:
+        for event in reversed(events):
+            usage = self._usage_from_response(event)
+            if usage is not None:
+                return usage
+        return None
+
+    def _usage_from_response(self, data: dict[str, Any]) -> ProviderUsage | None:
+        raw_usage = data.get("usage")
+        if not isinstance(raw_usage, dict):
+            return None
+        prompt_details = raw_usage.get("prompt_tokens_details") or {}
+        cached_tokens = prompt_details.get("cached_tokens")
+        return ProviderUsage(
+            provider="openai",
+            input_tokens=_int_or_none(raw_usage.get("prompt_tokens")),
+            output_tokens=_int_or_none(raw_usage.get("completion_tokens")),
+            cached_tokens=_int_or_none(cached_tokens),
+            cache_read_input_tokens=_int_or_none(cached_tokens),
+            raw=raw_usage,
+        )
+
     def _raise_for_status(self, response: httpx.Response) -> None:
         try:
             response.raise_for_status()
@@ -266,3 +340,10 @@ class OpenAIProvider(SSEClientMixin, ChatProvider):
             if response.status_code in {401, 403}:
                 raise ProviderError("Authentication failed. Check your API key.") from exc
             raise ProviderError(f"Provider request failed with HTTP {response.status_code}.") from exc
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None

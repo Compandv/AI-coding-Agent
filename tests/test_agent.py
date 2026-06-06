@@ -126,10 +126,12 @@ def test_agent_blocks_unsafe_tools_in_plan_mode_and_continues_to_final_plan(tmp_
     assert result.tool_result["metadata"]["blocked_by_plan_mode"] is True
     assert not (tmp_path / "note.txt").exists()
     assert result.final_text == "Plan: create note.txt with hi after approval."
-    assert session.messages[0]["content"].startswith("You are in MewCode Plan Mode.")
+    assert session.messages[0]["content"] == "create note"
+    assert provider.calls[0]["messages"].system.startswith("## Identity")
+    assert "Full Plan Mode guidance" in provider.calls[0]["messages"].messages[-1]["content"]
 
 
-def test_agent_plan_mode_can_write_plan_file_but_still_blocks_source_writes(tmp_path):
+def test_agent_plan_mode_blocks_plan_file_by_default(tmp_path):
     provider = NoStreamProvider(
         [
             ChatResponse(
@@ -147,12 +149,32 @@ def test_agent_plan_mode_can_write_plan_file_but_still_blocks_source_writes(tmp_
 
     result = agent.run_turn(session, "plan a shop", mode="plan")
 
-    assert (tmp_path / "plans" / "shop.md").read_text(encoding="utf-8") == "# Plan\n\nBuild MVP."
+    assert not (tmp_path / "plans" / "shop.md").exists()
     assert not (tmp_path / "app.py").exists()
-    assert [tool_result["ok"] for tool_result in result.tool_results] == [True, False]
-    assert result.tool_results[0]["metadata"]["plan_file"] is True
+    assert [tool_result["ok"] for tool_result in result.tool_results] == [False, False]
+    assert result.tool_results[0]["metadata"]["requires_explicit_plan_file"] is True
     assert result.tool_results[1]["metadata"]["blocked_by_plan_mode"] is True
     assert result.final_text == "Plan file is ready. Please accept or adjust it."
+
+
+def test_agent_plan_mode_can_write_plan_file_when_user_explicitly_asks(tmp_path):
+    provider = NoStreamProvider(
+        [
+            ChatResponse(
+                text="",
+                tool_call=ToolCall(name="WritePlanFile", arguments={"path": "plans/shop.md", "content": "# Plan"}),
+            ),
+            ChatResponse(text="Saved the plan file."),
+        ]
+    )
+    agent = SingleToolAgent(provider=provider, registry=default_registry(), context=ToolContext(root_dir=tmp_path))
+    session = ChatSession()
+
+    result = agent.run_turn(session, "plan a shop and save the plan file", mode="plan")
+
+    assert (tmp_path / "plans" / "shop.md").read_text(encoding="utf-8") == "# Plan"
+    assert result.tool_result["metadata"]["plan_file"] is True
+    assert result.final_text == "Saved the plan file."
 
 
 def test_agent_plan_mode_ask_user_question_stops_for_clarification(tmp_path):
@@ -181,6 +203,49 @@ def test_agent_plan_mode_ask_user_question_stops_for_clarification(tmp_path):
     assert questions[0].question == "Is this a new project or inside this repo?"
     assert questions[0].options == ["New project", "Inside this repo"]
     assert events[-1].reason == "await_user"
+
+
+def test_agent_plan_mode_reminders_are_request_overlays_not_session_history(tmp_path):
+    readme = tmp_path / "README.md"
+    readme.write_text("project", encoding="utf-8")
+    provider = NoStreamProvider(
+        [
+            ChatResponse(text="", tool_call=ToolCall(name="Glob", arguments={"pattern": "*.md"})),
+            ChatResponse(text="", tool_call=ToolCall(name="ReadFile", arguments={"path": "README.md"})),
+            ChatResponse(text="Plan ready."),
+        ]
+    )
+    agent = SingleToolAgent(provider=provider, registry=default_registry(), context=ToolContext(root_dir=tmp_path))
+    session = ChatSession()
+
+    result = agent.run_turn(session, "plan with context", mode="plan")
+
+    assert result.final_text == "Plan ready."
+    assert all("<system-reminder>" not in str(message.get("content", "")) for message in session.messages)
+    assert "Full Plan Mode guidance" in provider.calls[0]["messages"].messages[-1]["content"]
+    assert "Plan Mode is active" in provider.calls[1]["messages"].messages[-1]["content"]
+
+
+def test_agent_plan_mode_repeats_full_reminder_on_fifth_model_request(tmp_path):
+    provider = NoStreamProvider(
+        [
+            ChatResponse(text="", tool_call=ToolCall(name="Glob", arguments={})),
+            ChatResponse(text="", tool_call=ToolCall(name="Glob", arguments={})),
+            ChatResponse(text="", tool_call=ToolCall(name="Glob", arguments={})),
+            ChatResponse(text="", tool_call=ToolCall(name="Glob", arguments={})),
+            ChatResponse(text="Final plan."),
+        ]
+    )
+    agent = SingleToolAgent(provider=provider, registry=default_registry(), context=ToolContext(root_dir=tmp_path))
+    session = ChatSession()
+
+    result = agent.run_turn(session, "plan something", mode="plan")
+
+    assert result.final_text == "Final plan."
+    assert "Full Plan Mode guidance" in provider.calls[0]["messages"].messages[-1]["content"]
+    assert "Plan Mode is active" in provider.calls[1]["messages"].messages[-1]["content"]
+    assert "Plan Mode is active" in provider.calls[3]["messages"].messages[-1]["content"]
+    assert "Full Plan Mode guidance" in provider.calls[4]["messages"].messages[-1]["content"]
 
 
 def test_agent_plan_mode_ask_user_question_parses_single_custom_option(tmp_path):
@@ -328,8 +393,8 @@ def test_agent_reports_missing_tool_arguments_and_lets_model_continue(tmp_path):
     assert result.final_text == "I need a pattern."
 
 
-def test_agent_default_max_tool_steps_is_eight():
-    assert DEFAULT_MAX_TOOL_STEPS == 8
+def test_agent_default_max_tool_steps_is_twenty_four():
+    assert DEFAULT_MAX_TOOL_STEPS == 24
 
 
 def test_legacy_confirm_and_deny_methods_remain_callable(tmp_path):

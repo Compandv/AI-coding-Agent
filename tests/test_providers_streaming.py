@@ -3,6 +3,7 @@ import json
 import httpx
 
 from mewcode.config import MewCodeConfig
+from mewcode.prompts import CachePolicy, PromptPayload
 from mewcode.providers.anthropic import (
     AnthropicProvider,
     parse_anthropic_tool_call_stream,
@@ -299,3 +300,83 @@ def test_openai_sends_parameters_not_input_schema():
     assert "parameters" in captured["json"]["tools"][0]["function"]
     assert "input_schema" not in captured["json"]["tools"][0]["function"]
     assert captured["json"]["tools"][0]["function"]["parameters"]["required"] == ["pattern"]
+
+
+def test_openai_prompt_payload_sends_system_without_anthropic_cache_control():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["json"] = json.loads(request.content)
+        return make_response([
+            {
+                "choices": [{"delta": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 1200, "completion_tokens": 2, "prompt_tokens_details": {"cached_tokens": 1024}},
+            }
+        ])
+
+    config = MewCodeConfig(
+        protocol="openai",
+        model="gpt-4.1",
+        base_url="https://api.openai.com/v1",
+        api_key="sk-placeholder",
+    )
+    provider = OpenAIProvider(config, client=httpx.Client(transport=httpx.MockTransport(handler)))
+    prompt = PromptPayload(
+        system="stable system",
+        messages=[{"role": "user", "content": "hello"}],
+        tools=[],
+        cache_policy=CachePolicy(cache_system=True, cache_tools=True),
+    )
+
+    chunks = list(provider.stream_response(prompt))
+
+    assert captured["json"]["messages"][0] == {"role": "system", "content": "stable system"}
+    assert "cache_control" not in json.dumps(captured["json"])
+    assert chunks[-1].usage.provider == "openai"
+    assert chunks[-1].usage.cached_tokens == 1024
+
+
+def test_anthropic_prompt_payload_sends_cache_control_for_system_and_tools():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["json"] = json.loads(request.content)
+        return make_response([
+            {
+                "type": "message_delta",
+                "usage": {
+                    "input_tokens": 4096,
+                    "output_tokens": 8,
+                    "cache_creation_input_tokens": 2048,
+                    "cache_read_input_tokens": 1024,
+                },
+            },
+            {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "ok"}},
+        ])
+
+    config = MewCodeConfig(
+        protocol="anthropic",
+        model="claude-sonnet-4-6",
+        base_url="https://api.anthropic.com",
+        api_key="sk-ant-placeholder",
+    )
+    provider = AnthropicProvider(config, client=httpx.Client(transport=httpx.MockTransport(handler)))
+    prompt = PromptPayload(
+        system="stable system",
+        messages=[{"role": "user", "content": "hello"}],
+        tools=[
+            {"name": "ReadFile", "description": "Read", "input_schema": {"type": "object"}},
+            {"name": "Glob", "description": "Glob", "input_schema": {"type": "object"}},
+        ],
+        cache_policy=CachePolicy(cache_system=True, cache_tools=True),
+    )
+
+    chunks = list(provider.stream_response(prompt, tools=prompt.tools))
+
+    assert captured["json"]["system"][0]["text"] == "stable system"
+    assert captured["json"]["system"][0]["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in captured["json"]["tools"][0]
+    assert captured["json"]["tools"][1]["cache_control"] == {"type": "ephemeral"}
+    assert chunks[-1].usage.provider == "anthropic"
+    assert chunks[-1].usage.cache_creation_input_tokens == 2048
+    assert chunks[-1].usage.cache_read_input_tokens == 1024

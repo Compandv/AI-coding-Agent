@@ -26,9 +26,16 @@ def test_registry_prompts_glob_and_grep_more_explicitly():
 
     assert "entry files" in definitions["Glob"]["description"]
     assert "**/main.py" in definitions["Glob"]["description"]
+    assert "Prefer Glob over Bash" in definitions["Glob"]["description"]
     assert "Required. A glob pattern" in definitions["Glob"]["input_schema"]["properties"]["pattern"]["description"]
     assert "symbol" in definitions["Grep"]["description"]
+    assert "then use ReadFile" in definitions["Grep"]["description"]
+    assert "Prefer Grep over Bash" in definitions["Grep"]["description"]
     assert "Required. Text to search for inside files." in definitions["Grep"]["input_schema"]["properties"]["query"]["description"]
+    assert "before EditFile" in definitions["ReadFile"]["description"]
+    assert "Read the target file first" in definitions["EditFile"]["description"]
+    assert "Create or overwrite" in definitions["WriteFile"]["description"]
+    assert "Prefer Glob, Grep, ReadFile, WriteFile, and EditFile" in definitions["Bash"]["description"]
 
 
 def test_registry_ask_user_question_options_support_custom_other():

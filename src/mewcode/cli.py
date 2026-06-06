@@ -52,6 +52,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     session = ChatSession()
     context = ToolContext(root_dir=Path.cwd(), timeout_seconds=config.timeout_seconds)
-    agent = SingleToolAgent(provider=provider, registry=default_registry(), context=context)
+    agent = SingleToolAgent(
+        provider=provider,
+        registry=default_registry(),
+        context=context,
+        max_tool_steps=config.max_tool_steps,
+    )
     repl = MewCodeRepl(provider=provider, config=config, session=session, agent=agent)
     return repl.run()

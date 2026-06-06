@@ -10,7 +10,11 @@ from .context import ToolContext
 class ReadFileTool(Tool):
     definition = ToolDefinition(
         name="ReadFile",
-        description="Read the contents of a file in the current workspace.",
+        description=(
+            "Read the contents of a file in the current workspace. Use this after Glob or Grep identifies a candidate "
+            "path, and before EditFile when you need to modify an existing file. Prefer ReadFile over Bash commands "
+            "like cat or type for inspecting workspace files."
+        ),
         schema=ToolSchema(
             properties={
                 "path": ToolParameter(type="string", description="Path to the file to read."),
@@ -35,7 +39,11 @@ class ReadFileTool(Tool):
 class WriteFileTool(Tool):
     definition = ToolDefinition(
         name="WriteFile",
-        description="Create or overwrite a file in the current workspace.",
+        description=(
+            "Create or overwrite a file in the current workspace. Use this for new files or deliberate full-file "
+            "replacement. Read an existing file first when preserving unknown content matters, because this tool can "
+            "replace the whole file. After writing, use ReadFile or Bash tests when verification is useful."
+        ),
         schema=ToolSchema(
             properties={
                 "path": ToolParameter(type="string", description="Path to the file to write."),
@@ -59,7 +67,11 @@ class WriteFileTool(Tool):
 class EditFileTool(Tool):
     definition = ToolDefinition(
         name="EditFile",
-        description="Replace a uniquely matched string inside a file in the current workspace.",
+        description=(
+            "Replace a uniquely matched string inside an existing workspace file. Read the target file first and build "
+            "old_string from exact observed content. Use this for focused edits instead of rewriting whole files. After "
+            "editing, use ReadFile or a relevant Bash verification command when useful."
+        ),
         schema=ToolSchema(
             properties={
                 "path": ToolParameter(type="string", description="Path to the file to edit."),

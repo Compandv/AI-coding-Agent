@@ -11,7 +11,12 @@ from .context import ToolContext
 class BashTool(Tool):
     definition = ToolDefinition(
         name="Bash",
-        description="Run a shell command in the current workspace.",
+        description=(
+            "Run a shell command in the current workspace when command execution is necessary, such as running tests, "
+            "formatters, build commands, or project-specific scripts. Prefer Glob, Grep, ReadFile, WriteFile, and "
+            "EditFile for normal file search, inspection, and editing. Use Bash after changes when a command is the "
+            "right way to verify behavior."
+        ),
         schema=ToolSchema(
             properties={
                 "command": ToolParameter(type="string", description="Shell command to execute."),

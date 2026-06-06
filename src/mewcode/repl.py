@@ -9,6 +9,9 @@ import sys
 import threading
 import time
 
+from rich.console import Group
+from rich.markdown import Markdown as RichMarkdown
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
@@ -226,6 +229,10 @@ def user_message_text(content: str) -> str:
 
 def assistant_message_text(content: str) -> str:
     return f"[bold magenta]●[/bold magenta] {escaped_text(content)}"
+
+
+def assistant_message_renderable(content: str) -> Group:
+    return Group(Text("●", style="bold magenta"), RichMarkdown(content))
 
 
 def status_message_text(icon: str, phase: str, elapsed_seconds: int) -> str:
@@ -587,7 +594,7 @@ class ChatMessage(Static):
         if self.message.role == "user":
             self.update(user_message_text(self.message.content))
         elif self.message.role == "assistant":
-            self.update(assistant_message_text(self.message.content))
+            self.update(assistant_message_renderable(self.message.content))
         else:
             self.update(self.message.content)
 
@@ -713,8 +720,8 @@ class MewCodeApp(App[int]):
         event.stop()
         if self._clarification_state is not None:
             custom_text = event.value
-            event.input.value = ""
-            self._handle_clarification_enter(custom_text)
+            if self._handle_clarification_enter(custom_text):
+                event.input.value = ""
             return
         text = event.value.strip()
         event.input.value = ""
@@ -875,7 +882,7 @@ class MewCodeApp(App[int]):
     def _handle_clarification_key(self, event) -> bool:
         if self._clarification_state is None:
             return False
-        if event.key not in {"left", "right", "up", "down"}:
+        if event.key not in {"left", "right", "up", "down", "enter"}:
             return False
         event.stop()
         event.prevent_default()
@@ -887,6 +894,10 @@ class MewCodeApp(App[int]):
             self._move_clarification_selection(-1)
         elif event.key == "down":
             self._move_clarification_selection(1)
+        elif event.key == "enter":
+            prompt = self.query_one("#prompt-input", Input)
+            if self._handle_clarification_enter(prompt.value):
+                prompt.value = ""
         return True
 
     def _move_clarification_left(self) -> None:
@@ -921,25 +932,27 @@ class MewCodeApp(App[int]):
         state.set_selected_index(state.question_index, current + delta)
         self._refresh_clarification()
 
-    def _handle_clarification_enter(self, custom_text: str = "") -> None:
+    def _handle_clarification_enter(self, custom_text: str = "") -> bool:
         state = self._clarification_state
         if state is None:
-            return
+            return False
         question_count = len(state.questions)
         if state.question_index >= question_count:
             if state.all_answered():
                 self.run_worker(self._submit_clarification(), exclusive=True, group="turn")
-            return
+                return True
+            return False
         if not state.confirm_current(custom_text):
             self._refresh_clarification()
             self.call_after_refresh(self._focus_input)
-            return
+            return False
         if state.question_index == question_count - 1:
             if state.all_answered():
                 state.question_index = question_count
         else:
             state.question_index += 1
         self._refresh_clarification()
+        return True
 
     async def _submit_clarification(self) -> None:
         state = self._clarification_state

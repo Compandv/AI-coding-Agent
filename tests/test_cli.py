@@ -31,16 +31,18 @@ def test_cli_loads_config_and_runs_repl(monkeypatch, tmp_path):
         model="gpt-4.1",
         base_url="https://api.openai.com/v1",
         api_key="secret",
+        max_tool_steps=32,
     )
     calls = {}
 
     monkeypatch.setattr(cli, "load_config", lambda: config)
     monkeypatch.setattr(cli, "create_provider", lambda loaded: calls.setdefault("config", loaded) or FakeProvider())
-    monkeypatch.setattr(cli, "MewCodeRepl", FakeRepl)
+    monkeypatch.setattr(cli, "MewCodeRepl", lambda *args, **kwargs: calls.setdefault("repl", FakeRepl(*args, **kwargs)))
     monkeypatch.setattr(cli, "Path", type("PathShim", (), {"cwd": staticmethod(lambda: tmp_path)}))
 
     assert cli.main([]) == 0
     assert calls["config"] is config
+    assert calls["repl"].agent.max_tool_steps == 32
 
 
 def test_cli_reports_config_error(monkeypatch, capsys):

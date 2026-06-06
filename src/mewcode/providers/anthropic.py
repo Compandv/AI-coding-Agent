@@ -7,9 +7,10 @@ from typing import Any
 import httpx
 
 from mewcode.config import MewCodeConfig
+from mewcode.prompts import PromptPayload
 from mewcode.session import Message
 
-from .base import ChatProvider, ChatResponse, StreamChunk, ToolCall
+from .base import ChatProvider, ChatResponse, ProviderUsage, StreamChunk, ToolCall
 from .errors import ProviderError
 from .sse import SSEClientMixin
 
@@ -68,13 +69,15 @@ class AnthropicProvider(SSEClientMixin, ChatProvider):
         self.config = config
         self.client = client or httpx.Client(timeout=config.timeout_seconds)
 
-    def stream_chat(self, messages: list[Message]) -> Iterator[str]:
+    def stream_chat(self, messages: list[Message] | PromptPayload) -> Iterator[str]:
+        prompt = self._prompt_payload(messages, tools=None)
         payload: dict[str, Any] = {
             "model": self.config.model,
-            "messages": self._messages_payload(messages),
+            "messages": self._messages_payload(prompt),
             "stream": True,
             "max_tokens": int(self.config.extra.get("max_tokens", 4096)),
         }
+        self._add_system_payload(payload, prompt)
         thinking = self._thinking_payload()
         if thinking:
             payload["thinking"] = thinking
@@ -97,15 +100,19 @@ class AnthropicProvider(SSEClientMixin, ChatProvider):
         except httpx.HTTPError as exc:
             raise ProviderError(f"Network or connection failed: {exc}") from exc
 
-    def complete_chat(self, messages: list[Message], tools: list[dict[str, Any]] | None = None) -> ChatResponse:
-        if tools:
-            return self._complete_chat_with_tools_stream(messages, tools)
+    def complete_chat(
+        self, messages: list[Message] | PromptPayload, tools: list[dict[str, Any]] | None = None
+    ) -> ChatResponse:
+        prompt = self._prompt_payload(messages, tools=tools)
+        if prompt.tools:
+            return self._complete_chat_with_tools_stream(prompt, prompt.tools)
         payload: dict[str, Any] = {
             "model": self.config.model,
-            "messages": self._messages_payload(messages),
+            "messages": self._messages_payload(prompt),
             "stream": False,
             "max_tokens": int(self.config.extra.get("max_tokens", 4096)),
         }
+        self._add_system_payload(payload, prompt)
         thinking = self._thinking_payload()
         if thinking:
             payload["thinking"] = thinking
@@ -124,23 +131,55 @@ class AnthropicProvider(SSEClientMixin, ChatProvider):
 
         data = response.json()
         text = "".join(block.get("text", "") for block in data.get("content", []) if block.get("type") == "text")
-        return ChatResponse(text=text)
+        return ChatResponse(text=text, usage=self._usage_from_response(data))
 
     def stream_response(
-        self, messages: list[Message], tools: list[dict[str, Any]] | None = None
+        self, messages: list[Message] | PromptPayload, tools: list[dict[str, Any]] | None = None
     ) -> Iterator[StreamChunk]:
-        if not tools:
-            for text in self.stream_chat(messages):
-                yield StreamChunk(text=text)
+        prompt = self._prompt_payload(messages, tools=tools)
+        if not prompt.tools:
+            payload: dict[str, Any] = {
+                "model": self.config.model,
+                "messages": self._messages_payload(prompt),
+                "stream": True,
+                "max_tokens": int(self.config.extra.get("max_tokens", 4096)),
+            }
+            self._add_system_payload(payload, prompt)
+            thinking = self._thinking_payload()
+            if thinking:
+                payload["thinking"] = thinking
+
+            headers = {
+                "x-api-key": self.config.api_key,
+                "anthropic-version": str(self.config.extra.get("anthropic_version", "2023-06-01")),
+                "content-type": "application/json",
+                "accept": "text/event-stream",
+            }
+            url = f"{self.config.base_url}/v1/messages"
+            events: list[dict[str, Any]] = []
+            try:
+                with self.client.stream("POST", url, headers=headers, json=payload) as response:
+                    self._raise_for_status(response)
+                    for event in self._iter_sse_json(response):
+                        events.append(event)
+                        text = self._text_delta(event)
+                        if text:
+                            yield StreamChunk(text=text)
+            except httpx.HTTPError as exc:
+                raise ProviderError(f"Network or connection failed: {exc}") from exc
+            usage = self._usage_from_events(events)
+            if usage is not None:
+                yield StreamChunk(usage=usage)
             return
 
         payload: dict[str, Any] = {
             "model": self.config.model,
-            "messages": self._messages_payload(messages),
+            "messages": self._messages_payload(prompt),
             "stream": True,
             "max_tokens": int(self.config.extra.get("max_tokens", 4096)),
-            "tools": tools,
+            "tools": self._tools_payload(prompt),
         }
+        self._add_system_payload(payload, prompt)
         thinking = self._thinking_payload()
         if thinking:
             payload["thinking"] = thinking
@@ -165,17 +204,24 @@ class AnthropicProvider(SSEClientMixin, ChatProvider):
             raise ProviderError(f"Network or connection failed: {exc}") from exc
 
         tool_calls = parse_anthropic_tool_calls_stream(events)
+        usage = self._usage_from_events(events)
         if tool_calls:
-            yield StreamChunk(tool_calls=tool_calls)
+            yield StreamChunk(tool_calls=tool_calls, usage=usage)
+        elif usage is not None:
+            yield StreamChunk(usage=usage)
 
-    def _complete_chat_with_tools_stream(self, messages: list[Message], tools: list[dict[str, Any]]) -> ChatResponse:
+    def _complete_chat_with_tools_stream(
+        self, messages: list[Message] | PromptPayload, tools: list[dict[str, Any]]
+    ) -> ChatResponse:
+        prompt = self._prompt_payload(messages, tools=tools)
         payload: dict[str, Any] = {
             "model": self.config.model,
-            "messages": self._messages_payload(messages),
+            "messages": self._messages_payload(prompt),
             "stream": True,
             "max_tokens": int(self.config.extra.get("max_tokens", 4096)),
-            "tools": tools,
+            "tools": self._tools_payload(prompt),
         }
+        self._add_system_payload(payload, prompt)
         thinking = self._thinking_payload()
         if thinking:
             payload["thinking"] = thinking
@@ -201,13 +247,35 @@ class AnthropicProvider(SSEClientMixin, ChatProvider):
             raise ProviderError(f"Network or connection failed: {exc}") from exc
 
         tool_calls = parse_anthropic_tool_calls_stream(events)
+        usage = self._usage_from_events(events)
         if tool_calls:
-            return ChatResponse(text="", tool_calls=tool_calls)
-        return ChatResponse(text="".join(text_parts))
+            return ChatResponse(text="", tool_calls=tool_calls, usage=usage)
+        return ChatResponse(text="".join(text_parts), usage=usage)
 
-    def _messages_payload(self, messages: list[Message]) -> list[dict[str, Any]]:
+    def _prompt_payload(
+        self, messages: list[Message] | PromptPayload, tools: list[dict[str, Any]] | None
+    ) -> PromptPayload:
+        if isinstance(messages, PromptPayload):
+            return messages
+        return PromptPayload(system="", messages=messages, tools=tools or [])
+
+    def _add_system_payload(self, payload: dict[str, Any], prompt: PromptPayload) -> None:
+        if not prompt.system:
+            return
+        system_block: dict[str, Any] = {"type": "text", "text": prompt.system}
+        if prompt.cache_policy.cache_system:
+            system_block["cache_control"] = {"type": "ephemeral"}
+        payload["system"] = [system_block]
+
+    def _tools_payload(self, prompt: PromptPayload) -> list[dict[str, Any]]:
+        tools = [tool.copy() for tool in prompt.tools]
+        if tools and prompt.cache_policy.cache_tools:
+            tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
+        return tools
+
+    def _messages_payload(self, prompt: PromptPayload) -> list[dict[str, Any]]:
         payload = []
-        for message in messages:
+        for message in prompt.messages:
             role = message["role"]
             if role == "tool":
                 payload.append(
@@ -271,6 +339,30 @@ class AnthropicProvider(SSEClientMixin, ChatProvider):
                 return str(delta.get("text") or "")
         return ""
 
+    def _usage_from_events(self, events: list[dict[str, Any]]) -> ProviderUsage | None:
+        for event in reversed(events):
+            usage = self._usage_from_response(event)
+            if usage is not None:
+                return usage
+        return None
+
+    def _usage_from_response(self, data: dict[str, Any]) -> ProviderUsage | None:
+        raw_usage = data.get("usage")
+        if not isinstance(raw_usage, dict):
+            message = data.get("message")
+            if isinstance(message, dict):
+                raw_usage = message.get("usage")
+        if not isinstance(raw_usage, dict):
+            return None
+        return ProviderUsage(
+            provider="anthropic",
+            input_tokens=_int_or_none(raw_usage.get("input_tokens")),
+            output_tokens=_int_or_none(raw_usage.get("output_tokens")),
+            cache_read_input_tokens=_int_or_none(raw_usage.get("cache_read_input_tokens")),
+            cache_creation_input_tokens=_int_or_none(raw_usage.get("cache_creation_input_tokens")),
+            raw=raw_usage,
+        )
+
     def _raise_for_status(self, response: httpx.Response) -> None:
         try:
             response.raise_for_status()
@@ -278,3 +370,10 @@ class AnthropicProvider(SSEClientMixin, ChatProvider):
             if response.status_code in {401, 403}:
                 raise ProviderError("Authentication failed. Check your API key.") from exc
             raise ProviderError(f"Provider request failed with HTTP {response.status_code}.") from exc
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None

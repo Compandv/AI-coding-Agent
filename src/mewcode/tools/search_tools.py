@@ -16,7 +16,8 @@ class GlobTool(Tool):
         name="Glob",
         description=(
             "Find files in the current workspace that match a glob pattern. "
-            "Use this to locate entry files, folders, or file families before opening them. "
+            "Use this to locate entry files, folders, or file families before opening them with ReadFile. "
+            "Prefer Glob over Bash commands like ls, dir, or find when searching by path or filename. "
             "Always provide a non-empty pattern. For project entry points, start with patterns like "
             "**/main.py, **/app.py, **/cli.py, **/__main__.py, src/**/*.py, or tests/**/*.py."
         ),
@@ -46,8 +47,9 @@ class GrepTool(Tool):
         name="Grep",
         description=(
             "Search file contents in the current workspace. Use this when you know a symbol, phrase, "
-            "or error message and want to locate where it appears. Prefer short, unique queries such as "
-            "function names, class names, or exact log text."
+            "or error message and want to locate where it appears, then use ReadFile on the most relevant matches. "
+            "Prefer Grep over Bash commands like grep, rg, or Select-String for normal workspace content search. "
+            "Prefer short, unique queries such as function names, class names, or exact log text."
         ),
         schema=ToolSchema(
             properties={

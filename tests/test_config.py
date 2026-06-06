@@ -22,6 +22,7 @@ thinking:
   enabled: true
   budget_tokens: 1024
 timeout_seconds: 12
+max_tool_steps: 32
 custom: value
 """,
     )
@@ -34,7 +35,42 @@ custom: value
     assert config.api_key == "sk-ant-placeholder"
     assert config.thinking == {"enabled": True, "budget_tokens": 1024}
     assert config.timeout_seconds == 12
+    assert config.max_tool_steps == 32
     assert config.extra == {"custom": "value"}
+
+
+def test_load_config_uses_default_max_tool_steps(tmp_path):
+    path = write_config(
+        tmp_path / "config.yaml",
+        """
+protocol: openai
+model: gpt-4.1
+base_url: https://api.openai.com/v1
+api_key: secret
+""",
+    )
+
+    config = load_config(path)
+
+    assert config.max_tool_steps == 24
+
+
+def test_load_config_reports_invalid_max_tool_steps(tmp_path):
+    path = write_config(
+        tmp_path / "config.yaml",
+        """
+protocol: openai
+model: gpt-4.1
+base_url: https://api.openai.com/v1
+api_key: secret
+max_tool_steps: 0
+""",
+    )
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(path)
+
+    assert "max_tool_steps" in str(exc_info.value)
 
 
 def test_load_config_reports_missing_fields(tmp_path):

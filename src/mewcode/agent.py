@@ -5,20 +5,14 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from mewcode.providers.base import ChatProvider, ChatResponse, StreamChunk, ToolCall
+from mewcode.prompts import PromptPayload, assemble_api_payload
+from mewcode.providers.base import ChatProvider, ChatResponse, ProviderUsage, StreamChunk, ToolCall
 from mewcode.session import ChatSession
 from mewcode.tools import ToolContext, ToolError, ToolRegistry
 
 
 AgentMode = Literal["normal", "plan"]
-DEFAULT_MAX_TOOL_STEPS = 8
-PLAN_MODE_PREFIX = (
-    "You are in MewCode Plan Mode. First clarify broad or ambiguous requests with AskUserQuestion. "
-    "If you already know several important clarifications, ask them in one AskUserQuestion call with a questions list. "
-    "Inspect the project with read-only tools only. Do not write source files, edit source files, or run shell commands. "
-    "You may write Markdown implementation plans with WritePlanFile under plans/ or docs/plans/. "
-    "When the plan is ready, summarize the plan file and ask the user to accept it or request adjustments.\n\n"
-)
+DEFAULT_MAX_TOOL_STEPS = 24
 
 
 @dataclass
@@ -78,6 +72,11 @@ class AgentError:
 
 
 @dataclass
+class PromptUsageObserved:
+    usage: ProviderUsage
+
+
+@dataclass
 class QuestionOption:
     label: str
     description: str = ""
@@ -133,6 +132,7 @@ AgentEvent = (
     | ToolFinished
     | ConfirmationRequired
     | AgentError
+    | PromptUsageObserved
     | UserQuestionRequested
     | TurnCancelled
     | TurnComplete
@@ -247,8 +247,10 @@ class SingleToolAgent:
     ) -> Iterator[AgentEvent]:
         self.reset_cancel()
         if user_text:
-            session.add_user_message(self._user_prompt(user_text, mode))
+            session.add_user_message(user_text)
         executed_steps = 0
+        model_request_index = 0
+        allow_plan_file_write = self._allows_plan_file_write(user_text)
         tool_definitions = self.registry.list_definitions()
 
         while executed_steps < self.max_tool_steps:
@@ -257,8 +259,10 @@ class SingleToolAgent:
                 return
 
             yield AgentStatus("Thinking")
+            model_request_index += 1
             try:
-                step = yield from self._collect_model_step(session, tool_definitions)
+                prompt_payload = self._prompt_payload(session, tool_definitions, mode, model_request_index)
+                step = yield from self._collect_model_step(prompt_payload)
             except Exception as exc:
                 yield AgentError(str(exc))
                 yield TurnComplete("error")
@@ -280,7 +284,7 @@ class SingleToolAgent:
             tool_calls = step.tool_calls[:remaining]
             session.add_tool_calls([tool_call_payload(tool_call, index) for index, tool_call in enumerate(tool_calls)])
 
-            results = yield from self._execute_tool_calls(tool_calls, mode)
+            results = yield from self._execute_tool_calls(tool_calls, mode, allow_plan_file_write=allow_plan_file_write)
             for index, (tool_call, result) in enumerate(zip(tool_calls, results)):
                 session.add_tool_result(tool_call.name, result, tool_id=tool_call_id(tool_call, index))
             executed_steps += len(tool_calls)
@@ -321,15 +325,17 @@ class SingleToolAgent:
         yield ToolFinished(pending.tool_call, result)
         yield from self.stream_turn(session, "", mode="normal")
 
-    def _collect_model_step(self, session: ChatSession, tool_definitions: list[dict[str, Any]]) -> Iterator[AgentEvent | ModelStep]:
+    def _collect_model_step(self, prompt_payload: PromptPayload) -> Iterator[AgentEvent | ModelStep]:
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
-        for chunk in self._stream_provider_response(session.snapshot(), tools=tool_definitions):
+        for chunk in self._stream_provider_response(prompt_payload):
             if self._cancel_requested:
                 return ModelStep("".join(text_parts), tool_calls)
             if chunk.text:
                 text_parts.append(chunk.text)
                 yield TextDelta(chunk.text)
+            if chunk.usage is not None:
+                yield PromptUsageObserved(chunk.usage)
             if chunk.tool_calls:
                 tool_calls.extend(chunk.tool_calls)
             elif chunk.tool_call is not None:
@@ -338,20 +344,26 @@ class SingleToolAgent:
 
     def _stream_provider_response(
         self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
+        prompt_payload: PromptPayload,
     ) -> Iterator[StreamChunk]:
         stream_response = getattr(self.provider, "stream_response", None)
         if stream_response is not None:
-            yield from stream_response(messages, tools=tools)
+            yield from stream_response(prompt_payload, tools=prompt_payload.tools)
             return
-        response: ChatResponse = self.provider.complete_chat(messages, tools=tools)
+        response: ChatResponse = self.provider.complete_chat(prompt_payload, tools=prompt_payload.tools)
         if response.tool_calls:
-            yield StreamChunk(tool_calls=response.tool_calls)
+            yield StreamChunk(tool_calls=response.tool_calls, usage=response.usage)
         elif response.text:
-            yield StreamChunk(text=response.text)
+            yield StreamChunk(text=response.text, usage=response.usage)
+        elif response.usage is not None:
+            yield StreamChunk(usage=response.usage)
 
-    def _execute_tool_calls(self, tool_calls: list[ToolCall], mode: AgentMode) -> Iterator[AgentEvent | list[dict[str, Any]]]:
+    def _execute_tool_calls(
+        self,
+        tool_calls: list[ToolCall],
+        mode: AgentMode,
+        allow_plan_file_write: bool = False,
+    ) -> Iterator[AgentEvent | list[dict[str, Any]]]:
         safe_calls, unsafe_calls = self.partition_tool_calls(tool_calls)
         results_by_id: dict[str, dict[str, Any]] = {}
 
@@ -360,7 +372,12 @@ class SingleToolAgent:
                 yield ToolStarted(tool_call)
             with ThreadPoolExecutor(max_workers=len(safe_calls)) as executor:
                 futures = {
-                    tool_call_id(tool_call, index): executor.submit(self._tool_result_for_call, tool_call, mode)
+                    tool_call_id(tool_call, index): executor.submit(
+                        self._tool_result_for_call,
+                        tool_call,
+                        mode,
+                        allow_plan_file_write,
+                    )
                     for index, tool_call in enumerate(safe_calls)
                 }
                 for index, tool_call in enumerate(safe_calls):
@@ -374,7 +391,7 @@ class SingleToolAgent:
             if self._cancel_requested:
                 break
             yield ToolStarted(tool_call)
-            result = self._tool_result_for_call(tool_call, mode)
+            result = self._tool_result_for_call(tool_call, mode, allow_plan_file_write)
             results_by_id[tool_call_id(tool_call, index)] = result
             yield ToolFinished(tool_call, result)
 
@@ -397,11 +414,28 @@ class SingleToolAgent:
                 unsafe.append(tool_call)
         return safe, unsafe
 
-    def _tool_result_for_call(self, tool_call: ToolCall, mode: AgentMode = "normal") -> dict[str, Any]:
+    def _tool_result_for_call(
+        self,
+        tool_call: ToolCall,
+        mode: AgentMode = "normal",
+        allow_plan_file_write: bool = False,
+    ) -> dict[str, Any]:
         try:
             tool = self.registry.get(tool_call.name)
         except ToolError as exc:
             return {"ok": False, "error": str(exc), "content": "", "metadata": {}}
+
+        if mode == "plan" and tool_call.name == "WritePlanFile" and not allow_plan_file_write:
+            return {
+                "ok": False,
+                "content": "",
+                "error": "Plan Mode only saves a plan file when the user explicitly asks for one.",
+                "metadata": {
+                    "blocked_by_plan_mode": True,
+                    "tool_name": tool_call.name,
+                    "requires_explicit_plan_file": True,
+                },
+            }
 
         if mode == "plan" and tool.definition.requires_confirmation:
             return {
@@ -530,7 +564,34 @@ class SingleToolAgent:
             if tool_call.id is None:
                 tool_call.id = f"{tool_call.name}_{index}"
 
-    def _user_prompt(self, user_text: str, mode: AgentMode) -> str:
-        if mode == "plan":
-            return f"{PLAN_MODE_PREFIX}{user_text}"
-        return user_text
+    def _prompt_payload(
+        self,
+        session: ChatSession,
+        tool_definitions: list[dict[str, Any]],
+        mode: AgentMode,
+        model_request_index: int,
+    ) -> PromptPayload:
+        return assemble_api_payload(
+            session_messages=session.snapshot(),
+            tools=tool_definitions,
+            root_dir=self.context.root_dir,
+            mode=mode,
+            model_request_index=model_request_index,
+        )
+
+    def _allows_plan_file_write(self, user_text: str) -> bool:
+        normalized = user_text.lower()
+        markers = [
+            "writeplanfile",
+            "plan file",
+            "save the plan",
+            "save plan",
+            "write the plan",
+            "保存计划",
+            "保存成计划",
+            "保存为计划",
+            "写计划文件",
+            "生成计划文件",
+            "落盘",
+        ]
+        return any(marker in normalized for marker in markers)

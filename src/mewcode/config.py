@@ -23,6 +23,7 @@ class MewCodeConfig:
     api_key: str
     thinking: dict[str, Any] = field(default_factory=dict)
     timeout_seconds: float = 60.0
+    max_tool_steps: int = 24
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -49,12 +50,24 @@ def load_config(path: Path | None = None) -> MewCodeConfig:
     if missing:
         raise ConfigError(f"Config file {config_path} is missing required field(s): {', '.join(missing)}")
 
-    extra = {key: value for key, value in raw.items() if key not in {*REQUIRED_FIELDS, "thinking", "timeout_seconds"}}
+    extra = {
+        key: value
+        for key, value in raw.items()
+        if key not in {*REQUIRED_FIELDS, "thinking", "timeout_seconds", "max_tool_steps"}
+    }
     timeout = raw.get("timeout_seconds", 60.0)
     try:
         timeout_seconds = float(timeout)
     except (TypeError, ValueError) as exc:
         raise ConfigError("Config field timeout_seconds must be a number.") from exc
+
+    raw_max_tool_steps = raw.get("max_tool_steps", 24)
+    try:
+        max_tool_steps = int(raw_max_tool_steps)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError("Config field max_tool_steps must be a positive integer.") from exc
+    if max_tool_steps < 1:
+        raise ConfigError("Config field max_tool_steps must be a positive integer.")
 
     thinking = raw.get("thinking") or {}
     if not isinstance(thinking, dict):
@@ -67,5 +80,6 @@ def load_config(path: Path | None = None) -> MewCodeConfig:
         api_key=str(raw["api_key"]),
         thinking=thinking,
         timeout_seconds=timeout_seconds,
+        max_tool_steps=max_tool_steps,
         extra=extra,
     )

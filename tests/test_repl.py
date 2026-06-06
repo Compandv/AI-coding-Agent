@@ -2,6 +2,8 @@ import asyncio
 from io import StringIO
 from pathlib import Path
 
+from rich.console import Group
+from rich.markdown import Markdown as RichMarkdown
 from textual.widgets import Input
 
 from mewcode.agent import (
@@ -26,6 +28,7 @@ from mewcode.repl import (
     MEWCODE_LOGO,
     MewCodeApp,
     MewCodeRepl,
+    assistant_message_renderable,
     assistant_message_text,
     clarification_questions_text,
     confirmation_status_text,
@@ -174,6 +177,14 @@ def test_message_text_escapes_rich_markup_from_model_content():
     assert assistant_message_text('```json\n["entry"]\n```') == (
         '[bold magenta]●[/bold magenta] ```json\n\\["entry"]\n```'
     )
+
+
+def test_assistant_message_renderable_uses_markdown_for_tui_output():
+    renderable = assistant_message_renderable("- item\n\n**你好**")
+
+    assert isinstance(renderable, Group)
+    assert isinstance(renderable.renderables[1], RichMarkdown)
+    assert renderable.renderables[1].markup == "- item\n\n**你好**"
 
 
 def test_status_text_uses_phase_colors_spinner_icon_and_elapsed_time():
@@ -480,6 +491,68 @@ def test_textual_clarification_other_option_accepts_custom_input():
             assert "- Tech stack: Vue + NestJS" in agent.calls[1]["text"]
             assert "- Tech stack: Other" not in agent.calls[1]["text"]
             assert any(message.content == "Plan ready." for message in app.messages)
+
+    asyncio.run(run_app())
+
+
+def test_textual_clarification_enter_key_confirms_normal_option_with_empty_input():
+    class FakeKeyEvent:
+        key = "enter"
+
+        def __init__(self) -> None:
+            self.stopped = False
+            self.prevented = False
+
+        def stop(self) -> None:
+            self.stopped = True
+
+        def prevent_default(self) -> None:
+            self.prevented = True
+
+    async def run_app() -> None:
+        tool_call = ToolCall(name="AskUserQuestion", arguments={"questions": []})
+        questions = [
+            ClarificationQuestion(
+                id="scope",
+                title="Project scope",
+                question="Where should the project live?",
+                options=[
+                    QuestionOption(label="Inside current repo", recommended=True),
+                    QuestionOption(label="Other", allow_custom_input=True),
+                ],
+            )
+        ]
+        question_event = UserQuestionRequested(tool_call=tool_call, questions=questions)
+        agent = SequencedStreamAgent(
+            [
+                [
+                    ToolStarted(tool_call=tool_call),
+                    ToolFinished(tool_call=tool_call, result={"ok": True, "content": "", "metadata": {"await_user": True}}),
+                    question_event,
+                    TurnComplete(reason="await_user"),
+                ],
+            ]
+        )
+        app = MewCodeApp(provider=FakeProvider(), config=config(), version="0.1.0", agent=agent)
+
+        async with app.run_test() as pilot:
+            prompt = app.query_one("#prompt-input", Input)
+            await pilot.pause()
+            prompt.value = "/plan build ecommerce"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            prompt.value = ""
+            event = FakeKeyEvent()
+            assert app._handle_clarification_key(event) is True
+            await pilot.pause()
+
+            assert event.stopped is True
+            assert event.prevented is True
+            assert app._clarification_state is not None
+            assert app._clarification_state.question_index == len(questions)
+            assert app._clarification_state.all_answered()
+            assert app._clarification_state.answer_label_for(0) == "Inside current repo"
 
     asyncio.run(run_app())
 
