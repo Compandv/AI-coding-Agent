@@ -25,6 +25,7 @@ class FakeProvider:
     pass
 
 
+
 def test_cli_loads_config_and_runs_repl(monkeypatch, tmp_path):
     config = MewCodeConfig(
         protocol="openai",
@@ -37,12 +38,28 @@ def test_cli_loads_config_and_runs_repl(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cli, "load_config", lambda: config)
     monkeypatch.setattr(cli, "create_provider", lambda loaded: calls.setdefault("config", loaded) or FakeProvider())
+    monkeypatch.setattr(
+        cli.PermissionChecker,
+        "from_workspace",
+        lambda context, mode: calls.setdefault("permission", FakePermissionChecker(context, mode)),
+    )
     monkeypatch.setattr(cli, "MewCodeRepl", lambda *args, **kwargs: calls.setdefault("repl", FakeRepl(*args, **kwargs)))
     monkeypatch.setattr(cli, "Path", type("PathShim", (), {"cwd": staticmethod(lambda: tmp_path)}))
 
     assert cli.main([]) == 0
     assert calls["config"] is config
+    assert calls["permission"].mode == "default"
     assert calls["repl"].agent.max_tool_steps == 32
+
+
+class FakePermissionChecker:
+    def __init__(self, context, mode):
+        self.context = context
+        self.mode = mode
+        self.read_tool_names = set()
+
+    def add_read_tools(self, tool_names):
+        self.read_tool_names.update(tool_names)
 
 
 def test_cli_reports_config_error(monkeypatch, capsys):

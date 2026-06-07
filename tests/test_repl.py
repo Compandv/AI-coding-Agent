@@ -34,7 +34,13 @@ from mewcode.repl import (
     confirmation_status_text,
     interrupted_status_text,
     last_assistant_text,
+    middle_dot,
     model_status_line,
+    permission_mode_color,
+    permission_status_line,
+    permission_status_markup,
+    permission_prompt_panel_text,
+    permission_prompt_status_text,
     question_message_text,
     should_use_line_mode_for_terminal,
     spinner_frames,
@@ -44,6 +50,7 @@ from mewcode.repl import (
     tool_running_text,
     transcript_text,
     user_message_text,
+    PermissionPromptState,
 )
 
 
@@ -89,8 +96,8 @@ class FakeAgent:
         self.calls.append({"session": session, "text": text, "mode": mode})
         yield from self._events_for(self.result)
 
-    def stream_confirm(self, session, pending):
-        self.confirm_calls.append({"session": session, "pending": pending})
+    def stream_confirm(self, session, pending, scope="once"):
+        self.confirm_calls.append({"session": session, "pending": pending, "scope": scope})
         yield from self._events_for(self.confirm_result)
 
     def stream_deny(self, session, pending):
@@ -164,7 +171,7 @@ def test_logo_is_block_style_and_header_uses_agent_branding():
 
 
 def test_model_status_line_mentions_model_effort_and_billing():
-    assert model_status_line(config()) == "gpt-4.1 with high effort · API Usage Billing"
+    assert model_status_line(config()) == f"gpt-4.1 with high effort {middle_dot()} API Usage Billing"
 
 
 def test_message_markers_are_colored_and_distinct():
@@ -190,7 +197,7 @@ def test_assistant_message_renderable_uses_markdown_for_tui_output():
 def test_status_text_uses_phase_colors_spinner_icon_and_elapsed_time():
     assert status_message_text("⠋", "Thinking", 8) == "[bold yellow]⠋ Thinking... (8s)[/bold yellow]"
     assert status_message_text("⠙", "Coding", 9) == "[bold cyan]⠙ Coding... (9s)[/bold cyan]"
-    assert interrupted_status_text(10) == "[bold red]* Done (interrupted · 10s)[/bold red]"
+    assert interrupted_status_text(10) == f"[bold red]* Done (interrupted {middle_dot()} 10s)[/bold red]"
 
 
 def test_tool_status_text_uses_action_target_and_elapsed_time():
@@ -268,9 +275,18 @@ def test_textual_app_header_removes_learning_tag_and_exposes_mode_hint():
     app = MewCodeApp(provider=FakeProvider(), config=config(), version="0.1.0")
 
     assert app.title_line == "MewCode Agent v0.1.0"
-    assert app.model_line == "gpt-4.1 with high effort · API Usage Billing"
+    assert "gpt-4.1 with high effort" in app.model_line
+    assert "Permission: Default" in app.model_line
+    assert f"API Usage Billing {middle_dot()} Permission: Default" in app.model_line
+    assert f"API Usage Billing {middle_dot()} [#9ca3af]Permission: Default[/#9ca3af]" in app.header_markup
+    assert "路" not in app.header_markup
+    assert "璺" not in app.header_markup
+    assert permission_status_line("acceptEdits") == "Permission: Edit"
+    assert permission_status_line("bypassPermissions") == "Permission: ⚠ Bypass"
+    assert permission_status_markup("bypassPermissions") == "[bold #f97316]Permission: ⚠ Bypass[/bold #f97316]"
+    assert permission_mode_color("plan") == "#a855f7"
     assert FOOTER_HINT == (
-        "esc interrupt · ctrl+c copy · ctrl+y last answer · ctrl+shift+y transcript · ctrl+q quit"
+        "esc interrupt · shift+tab permission · ctrl+c copy · ctrl+y last answer · ctrl+shift+y transcript · ctrl+q quit"
     )
 
 
@@ -290,6 +306,38 @@ def test_textual_input_keeps_focus_after_mount_and_submit():
 
             assert prompt.has_focus
             assert agent.calls[0]["text"] == "hello"
+
+    asyncio.run(run_app())
+
+
+def test_textual_shift_tab_cycles_permission_theme_on_focused_input():
+    async def run_app() -> None:
+        app = MewCodeApp(provider=FakeProvider(), config=config(), version="0.1.0")
+
+        async with app.run_test() as pilot:
+            prompt = app.query_one("#prompt-input", Input)
+            await pilot.pause()
+            assert prompt.has_focus
+            assert app.permission_mode == "default"
+            assert prompt.has_class("permission-mode-default")
+
+            await pilot.press("shift+tab")
+            await pilot.pause()
+            assert app.permission_mode == "acceptEdits"
+            assert prompt.has_class("permission-mode-edit")
+            assert "Permission: Edit" in app.model_line
+
+            await pilot.press("backtab")
+            await pilot.pause()
+            assert app.permission_mode == "plan"
+            assert prompt.has_class("permission-mode-plan")
+            assert "Permission: Plan" in app.model_line
+
+            await pilot.press("shift+tab")
+            await pilot.pause()
+            assert app.permission_mode == "bypassPermissions"
+            assert prompt.has_class("permission-mode-bypass")
+            assert "⚠ Bypass" in app.model_line
 
     asyncio.run(run_app())
 
@@ -356,6 +404,40 @@ def test_textual_tool_status_updates_to_finished_file_target():
             assert len(tool_messages) == 1
             assert tool_messages[0].startswith("[bold green]✓ Read src/mewcode/tools/search_tools.py (")
             assert tool_messages[0].endswith("s)[/bold green]")
+
+    asyncio.run(run_app())
+
+
+def test_textual_permission_prompt_uses_keyboard_selection_for_permanent_allow():
+    async def run_app() -> None:
+        tool_call = ToolCall(name="WriteFile", arguments={"path": "hello.txt", "content": "1"})
+        pending = PendingToolRequest(tool_call)
+        agent = FakeAgent(
+            result=AgentTurnResult(final_text="", needs_confirmation=True, pending_request=pending),
+            confirm_result=AgentTurnResult(final_text="Created."),
+        )
+        app = MewCodeApp(provider=FakeProvider(), config=config(), version="0.1.0", agent=agent)
+
+        async with app.run_test() as pilot:
+            prompt = app.query_one("#prompt-input", Input)
+            await pilot.pause()
+            prompt.value = "write hello"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert app.pending_request is pending
+            assert app._permission_prompt_state is not None
+            assert "Do you want to proceed?" in app._permission_prompt_widget.message.content
+            assert "hello.txt" in app._permission_prompt_widget.message.content
+
+            await pilot.press("down", "enter")
+            await pilot.pause()
+            await pilot.pause()
+
+            assert app.pending_request is None
+            assert app._permission_prompt_state is None
+            assert agent.confirm_calls[0]["scope"] == "permanent"
+            assert any(message.content == "Created." for message in app.messages)
 
     asyncio.run(run_app())
 
@@ -822,12 +904,51 @@ def test_line_mode_remembers_plan_file_and_accepts_it():
     assert "* Accepted plan: plans/shop.md. Use /do to start implementation or /plan to adjust." in rendered
 
 
+def test_line_mode_permission_confirmation_accepts_permanent_scope():
+    tool_call = ToolCall(name="WriteFile", arguments={"path": "note.txt", "content": "hi"})
+    pending = PendingToolRequest(tool_call)
+    agent = FakeAgent(
+        result=AgentTurnResult(final_text="", needs_confirmation=True, pending_request=pending),
+        confirm_result=AgentTurnResult(final_text="Created."),
+    )
+    inputs = iter(["create note", "always", "/quit"])
+    output = StringIO()
+    repl = MewCodeRepl(provider=FakeProvider(), config=config(), input_func=lambda prompt: next(inputs), output=output, agent=agent)
+
+    assert repl.run() == 0
+
+    assert agent.confirm_calls[0]["scope"] == "permanent"
+    rendered = output.getvalue()
+    assert "* Permission required for WriteFile" in rendered
+    assert "Created." in rendered
+
+
 def test_question_message_text_formats_options():
     assert question_message_text("Project location?", ["New", "Existing"]) == "Project location?\n- New\n- Existing"
 
 
 def test_confirmation_status_text_mentions_tool_name():
-    assert confirmation_status_text("WriteFile") == "[bold yellow]* Confirmation required for WriteFile (reply yes/no)[/bold yellow]"
+    assert confirmation_status_text("WriteFile") == (
+        "[bold yellow]* Permission required for WriteFile "
+        "(yes=allow once / always=allow permanently / no=deny once)[/bold yellow]"
+    )
+
+
+def test_permission_prompt_panel_renders_keyboard_choices_and_target():
+    tool_call = ToolCall(name="WriteFile", arguments={"path": "hello.txt", "content": "1"})
+    state = PermissionPromptState(PendingToolRequest(tool_call), selected_index=1)
+
+    rendered = permission_prompt_panel_text(state)
+
+    assert permission_prompt_status_text() == (
+        "[bold yellow]* Permission required - use up/down and enter, or type yes/always/no[/bold yellow]"
+    )
+    assert "Write hello.txt" in rendered
+    assert "WriteFile command" in rendered
+    assert "hello.txt" in rendered
+    assert "1. Yes" in rendered
+    assert "2. Yes, and don't ask again for this exact pattern." in rendered
+    assert "3. No" in rendered
 
 
 def test_tool_result_text_shows_failure_detail():

@@ -1,4 +1,12 @@
-from mewcode.agent import DEFAULT_MAX_TOOL_STEPS, PendingToolRequest, SingleToolAgent, UserQuestionRequested
+from mewcode.agent import (
+    DEFAULT_MAX_TOOL_STEPS,
+    ConfirmationRequired,
+    PendingToolRequest,
+    SingleToolAgent,
+    ToolFinished,
+    UserQuestionRequested,
+)
+from mewcode.permissions import PermissionChecker
 from mewcode.providers.base import ChatResponse, ToolCall
 from mewcode.session import ChatSession
 from mewcode.tools.context import ToolContext
@@ -18,6 +26,8 @@ class FakeProvider:
 class NoStreamProvider(FakeProvider):
     def stream_chat(self, messages):
         yield from ()
+
+
 
 
 def test_agent_returns_direct_answer_without_tool(tmp_path):
@@ -91,6 +101,32 @@ def test_agent_executes_multiple_tool_calls_from_one_model_response_and_preserve
     assert [message["tool_id"] for message in tool_result_messages] == ["read_a", "read_b"]
 
 
+def test_agent_preserves_result_order_for_mixed_tool_batch_without_provider_ids(tmp_path):
+    (tmp_path / "existing.txt").write_text("old", encoding="utf-8")
+    provider = NoStreamProvider(
+        [
+            ChatResponse(
+                text="",
+                tool_calls=[
+                    ToolCall(name="WriteFile", arguments={"path": "created.txt", "content": "new"}),
+                    ToolCall(name="ReadFile", arguments={"path": "existing.txt"}),
+                ],
+            ),
+            ChatResponse(text="Done."),
+        ]
+    )
+    agent = SingleToolAgent(provider=provider, registry=default_registry(), context=ToolContext(root_dir=tmp_path))
+    session = ChatSession()
+
+    result = agent.run_turn(session, "write and read")
+
+    assert [tool_result["ok"] for tool_result in result.tool_results] == [True, True]
+    assert "created.txt" in result.tool_results[0]["content"]
+    assert result.tool_results[1]["content"] == "old"
+    tool_result_messages = [message for message in session.messages if message["role"] == "tool"]
+    assert [message["tool_id"] for message in tool_result_messages] == ["WriteFile_0", "ReadFile_1"]
+
+
 def test_agent_executes_sensitive_tools_without_confirmation_in_normal_mode(tmp_path):
     provider = NoStreamProvider(
         [
@@ -108,6 +144,82 @@ def test_agent_executes_sensitive_tools_without_confirmation_in_normal_mode(tmp_
     assert result.tool_result["ok"] is True
     assert (tmp_path / "note.txt").read_text(encoding="utf-8") == "hi"
     assert result.final_text == "Created the file."
+
+
+def test_agent_requests_permission_confirmation_when_checker_asks(tmp_path):
+    provider = NoStreamProvider(
+        [ChatResponse(text="", tool_call=ToolCall(name="WriteFile", arguments={"path": "note.txt", "content": "hi"}))]
+    )
+    context = ToolContext(root_dir=tmp_path)
+    checker = PermissionChecker.from_workspace(context, mode="default", user_path=tmp_path / "missing-user.yaml")
+    agent = SingleToolAgent(provider=provider, registry=default_registry(), context=context, permission_checker=checker)
+    session = ChatSession()
+
+    events = list(agent.stream_turn(session, "create note"))
+
+    confirmations = [event for event in events if isinstance(event, ConfirmationRequired)]
+    assert len(confirmations) == 1
+    assert confirmations[0].pending_request.tool_call.name == "WriteFile"
+    assert events[-1].reason == "await_user"
+    assert not (tmp_path / "note.txt").exists()
+
+
+def test_agent_confirm_once_executes_pending_tool(tmp_path):
+    provider = NoStreamProvider([ChatResponse(text="Created.")])
+    context = ToolContext(root_dir=tmp_path)
+    checker = PermissionChecker.from_workspace(context, mode="default", user_path=tmp_path / "missing-user.yaml")
+    agent = SingleToolAgent(provider=provider, registry=default_registry(), context=context, permission_checker=checker)
+    session = ChatSession()
+    pending = PendingToolRequest(ToolCall(name="WriteFile", arguments={"path": "note.txt", "content": "hi"}))
+
+    events = list(agent.stream_confirm(session, pending))
+
+    assert (tmp_path / "note.txt").read_text(encoding="utf-8") == "hi"
+    finished = [event for event in events if isinstance(event, ToolFinished)]
+    assert finished[0].result["ok"] is True
+
+
+def test_agent_denies_dangerous_command_and_lets_model_continue(tmp_path):
+    provider = NoStreamProvider(
+        [
+            ChatResponse(text="", tool_call=ToolCall(name="Bash", arguments={"command": "rm -rf /"})),
+            ChatResponse(text="I will avoid that command."),
+        ]
+    )
+    context = ToolContext(root_dir=tmp_path)
+    checker = PermissionChecker.from_workspace(context, mode="bypassPermissions", user_path=tmp_path / "missing-user.yaml")
+    agent = SingleToolAgent(provider=provider, registry=default_registry(), context=context, permission_checker=checker)
+    session = ChatSession()
+
+    result = agent.run_turn(session, "clean temp files")
+
+    assert result.tool_result["ok"] is False
+    assert result.tool_result["metadata"]["blocked_by_dangerous_command"] is True
+    assert result.final_text == "I will avoid that command."
+
+
+def test_agent_denies_broad_env_read_and_lets_model_retry_exact_file(tmp_path):
+    (tmp_path / ".env").write_text("TOKEN=ok", encoding="utf-8")
+    provider = NoStreamProvider(
+        [
+            ChatResponse(text="", tool_call=ToolCall(name="ReadFile", arguments={"path": "*.env*"})),
+            ChatResponse(text="", tool_call=ToolCall(name="ReadFile", arguments={"path": ".env"})),
+            ChatResponse(text="Read the explicit env file."),
+        ]
+    )
+    context = ToolContext(root_dir=tmp_path)
+    checker = PermissionChecker.from_workspace(context, mode="bypassPermissions", user_path=tmp_path / "missing-user.yaml")
+    agent = SingleToolAgent(provider=provider, registry=default_registry(), context=context, permission_checker=checker)
+    session = ChatSession()
+
+    result = agent.run_turn(session, "read env files")
+
+    assert result.tool_results[0]["ok"] is False
+    assert result.tool_results[0]["metadata"]["blocked_by_sensitive_read_pattern"] is True
+    assert result.tool_results[0]["metadata"]["suggested_paths"][0] == ".env"
+    assert result.tool_results[1]["ok"] is True
+    assert result.tool_results[1]["content"] == "TOKEN=ok"
+    assert result.final_text == "Read the explicit env file."
 
 
 def test_agent_blocks_unsafe_tools_in_plan_mode_and_continues_to_final_plan(tmp_path):
@@ -395,6 +507,7 @@ def test_agent_reports_missing_tool_arguments_and_lets_model_continue(tmp_path):
 
 def test_agent_default_max_tool_steps_is_twenty_four():
     assert DEFAULT_MAX_TOOL_STEPS == 24
+
 
 
 def test_legacy_confirm_and_deny_methods_remain_callable(tmp_path):

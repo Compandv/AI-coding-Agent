@@ -35,6 +35,7 @@ from mewcode.agent import (
     UserQuestionRequested,
 )
 from mewcode.config import MewCodeConfig
+from mewcode.permissions import PERMISSION_MODES, PermissionMode
 from mewcode.providers import ChatProvider, ProviderError, ToolCall
 from mewcode.session import ChatSession
 
@@ -45,7 +46,7 @@ MEWCODE_LOGO = """███╗   ███╗
 ██║╚██╔╝██║
 ██║ ╚═╝ ██║"""
 
-FOOTER_HINT = "esc interrupt · ctrl+c copy · ctrl+y last answer · ctrl+shift+y transcript · ctrl+q quit"
+FOOTER_HINT = "esc interrupt · shift+tab permission · ctrl+c copy · ctrl+y last answer · ctrl+shift+y transcript · ctrl+q quit"
 LINE_MODE_HINT = "Line UI active. Set MEWCODE_UI=tui to force Textual. "
 BRAILLE_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 ASCII_SPINNER_FRAMES = ["|", "/", "-", "\\"]
@@ -61,6 +62,12 @@ PHASE_STYLES = {
 }
 TOOL_DONE_ICON = "\u2713"
 TOOL_FAILED_ICON = "x"
+PERMISSION_THEME_CLASSES = (
+    "permission-mode-default",
+    "permission-mode-edit",
+    "permission-mode-plan",
+    "permission-mode-bypass",
+)
 
 
 @dataclass
@@ -149,6 +156,39 @@ class ClarificationState:
         return option.label
 
 
+@dataclass(frozen=True)
+class PermissionChoice:
+    label: str
+    description: str
+    action: str
+    scope: str = "once"
+
+
+@dataclass
+class PermissionPromptState:
+    pending: PendingToolRequest
+    selected_index: int = 0
+
+    @property
+    def choices(self) -> list[PermissionChoice]:
+        return [
+            PermissionChoice("Yes", "Allow this tool call once.", "allow", "once"),
+            PermissionChoice(
+                "Yes, and don't ask again for this exact pattern.",
+                "Write an exact allow rule to .mewcode/permissions.local.yaml.",
+                "allow",
+                "permanent",
+            ),
+            PermissionChoice("No", "Deny this tool call and let the model choose another path.", "deny", "once"),
+        ]
+
+    def move(self, delta: int) -> None:
+        self.selected_index = max(0, min(self.selected_index + delta, len(self.choices) - 1))
+
+    def selected_choice(self) -> PermissionChoice:
+        return self.choices[self.selected_index]
+
+
 class PromptInput(Input):
     _KEY_TEXT = {
         "slash": "/",
@@ -165,9 +205,61 @@ class PromptInput(Input):
         else:
             self.replace(text, *selection)
 
+    def on_key(self, event) -> None:
+        if event.key in {"shift+tab", "backtab"}:
+            self.app.action_cycle_permission_mode()
+            event.stop()
+            event.prevent_default()
+
 
 def model_status_line(config: MewCodeConfig) -> str:
-    return f"{config.model} with high effort · API Usage Billing"
+    return f"{config.model} with high effort {middle_dot()} API Usage Billing"
+
+
+def middle_dot() -> str:
+    return chr(183)
+
+
+def permission_mode_label(mode: str) -> str:
+    labels = {
+        "default": "Default",
+        "acceptEdits": "Edit",
+        "plan": "Plan",
+        "bypassPermissions": "\u26a0 Bypass",
+    }
+    return labels.get(mode, mode)
+
+
+def permission_mode_color(mode: str) -> str:
+    colors = {
+        "default": "#9ca3af",
+        "acceptEdits": "#3b82f6",
+        "plan": "#a855f7",
+        "bypassPermissions": "#f97316",
+    }
+    return colors.get(mode, "#9ca3af")
+
+
+def permission_theme_class(mode: str) -> str:
+    classes = {
+        "default": "permission-mode-default",
+        "acceptEdits": "permission-mode-edit",
+        "plan": "permission-mode-plan",
+        "bypassPermissions": "permission-mode-bypass",
+    }
+    return classes.get(mode, "permission-mode-default")
+
+
+def permission_status_line(mode: str) -> str:
+    return f"Permission: {permission_mode_label(mode)}"
+
+
+def permission_status_markup(mode: str) -> str:
+    color = permission_mode_color(mode)
+    label = escaped_text(permission_mode_label(mode))
+    if mode == "bypassPermissions":
+        return f"[bold {color}]Permission: {label}[/bold {color}]"
+    return f"[{color}]Permission: {label}[/{color}]"
 
 
 def escaped_text(content: str) -> str:
@@ -247,7 +339,8 @@ def done_status_text(elapsed_seconds: int) -> str:
 
 def interrupted_status_text(elapsed_seconds: int) -> str:
     style = PHASE_STYLES["Interrupted"]
-    return f"[{style}]* Done (interrupted · {elapsed_seconds}s)[/{style}]"
+    sep = chr(183)
+    return f"[{style}]* Done (interrupted {sep} {elapsed_seconds}s)[/{style}]"
 
 
 def error_status_text(message: str) -> str:
@@ -256,7 +349,72 @@ def error_status_text(message: str) -> str:
 
 
 def confirmation_status_text(tool_name: str) -> str:
-    return f"[bold yellow]* Confirmation required for {escaped_text(tool_name)} (reply yes/no)[/bold yellow]"
+    return (
+        f"[bold yellow]* Permission required for {escaped_text(tool_name)} "
+        "(yes=allow once / always=allow permanently / no=deny once)[/bold yellow]"
+    )
+
+
+def confirmation_status_plain(tool_name: str) -> str:
+    return f"* Permission required for {tool_name} (yes=allow once / always=allow permanently / no=deny once)"
+
+
+def permission_prompt_status_text() -> str:
+    return "[bold yellow]* Permission required - use up/down and enter, or type yes/always/no[/bold yellow]"
+
+
+def tool_permission_target_text(tool_call: ToolCall) -> str:
+    if tool_call.name in {"ReadFile", "WriteFile", "EditFile", "WritePlanFile"}:
+        return str(tool_call.arguments.get("path") or "")
+    if tool_call.name == "Bash":
+        return str(tool_call.arguments.get("command") or "")
+    if tool_call.name == "Glob":
+        return str(tool_call.arguments.get("pattern") or "")
+    if tool_call.name == "Grep":
+        return str(tool_call.arguments.get("query") or "")
+    return compact_text(str(tool_call.arguments))
+
+
+def permission_prompt_panel_text(state: PermissionPromptState) -> str:
+    tool_call = state.pending.tool_call
+    lines = [
+        f"[bold cyan]{escaped_text(tool_action_label(tool_call))}[/bold cyan]",
+        "",
+        f"[bold yellow]{escaped_text(tool_call.name)} command[/bold yellow]",
+    ]
+    target = tool_permission_target_text(tool_call)
+    if target:
+        lines.extend(["", f"[white]{escaped_text(target)}[/white]"])
+    if state.pending.decision is not None and state.pending.decision.reason:
+        lines.extend(["", f"[dim]{escaped_text(state.pending.decision.reason)}[/dim]"])
+    lines.extend(["", "[bold white]Do you want to proceed?[/bold white]"])
+    for index, choice in enumerate(state.choices, start=1):
+        selected = index - 1 == state.selected_index
+        cursor = ">" if selected else " "
+        description = f" [dim]- {escaped_text(choice.description)}[/dim]" if choice.description else ""
+        line = f"{cursor} {index}. {escaped_text(choice.label)}{description}"
+        if selected:
+            lines.append(f"[bold cyan]{line}[/bold cyan]")
+        else:
+            lines.append(f"[dim]{line}[/dim]")
+    lines.extend(["", "[dim]up/down select - enter confirm[/dim]"])
+    return "\n".join(lines)
+
+
+def permission_mode_status_text(mode: str) -> str:
+    color = permission_mode_color(mode)
+    label = escaped_text(permission_mode_label(mode))
+    return f"[bold {color}]* Permission mode: {label}[/bold {color}]"
+
+
+def permission_mode_status_plain(mode: str) -> str:
+    return f"* Permission mode: {mode}"
+
+
+def next_permission_mode(mode: str) -> PermissionMode:
+    current = mode if mode in PERMISSION_MODES else PERMISSION_MODES[0]
+    index = PERMISSION_MODES.index(current)  # type: ignore[arg-type]
+    return PERMISSION_MODES[(index + 1) % len(PERMISSION_MODES)]
 
 
 def tool_running_text(tool_call: ToolCall, icon: str, elapsed_seconds: float) -> str:
@@ -611,7 +769,11 @@ class MewCodeApp(App[int]):
     ChatMessage { width: 100%; margin: 0 0 1 0; padding: 0 1; }
     ChatMessage.active-user { background: #2a2a2a; }
     #input-area { height: 3; padding: 0 2; background: #000000; }
-    #prompt-input { background: #111111; color: #ffffff; border: none; }
+    #prompt-input { background: #111111; color: #ffffff; border: solid #9ca3af; }
+    #prompt-input.permission-mode-default { border: solid #9ca3af; }
+    #prompt-input.permission-mode-edit { border: solid #3b82f6; }
+    #prompt-input.permission-mode-plan { border: solid #a855f7; }
+    #prompt-input.permission-mode-bypass { border: solid #f97316; }
     #bottom-help { height: 1; padding: 0 2; color: #8a8a8a; background: #000000; }
     """
 
@@ -619,6 +781,7 @@ class MewCodeApp(App[int]):
         Binding("escape", "interrupt", "Interrupt"),
         Binding("ctrl+c", "copy_selection_or_last_answer", "Copy", priority=True),
         Binding("ctrl+q", "quit", "Quit"),
+        Binding("shift+tab", "cycle_permission_mode", "Permission mode"),
         Binding("ctrl+y", "copy_last_answer", "Copy last answer"),
         Binding("ctrl+shift+y", "copy_transcript", "Copy transcript"),
     ]
@@ -654,9 +817,12 @@ class MewCodeApp(App[int]):
         self._tool_calls: dict[str, ToolCall] = {}
         self._tool_started_at: dict[str, float] = {}
         self.mode = "normal"
+        self.permission_mode = config.permission_mode
         self.last_plan_path: str | None = None
         self._clarification_state: ClarificationState | None = None
         self._clarification_widget: ChatMessage | None = None
+        self._permission_prompt_state: PermissionPromptState | None = None
+        self._permission_prompt_widget: ChatMessage | None = None
 
     @property
     def title_line(self) -> str:
@@ -664,13 +830,21 @@ class MewCodeApp(App[int]):
 
     @property
     def model_line(self) -> str:
-        return model_status_line(self.config)
+        return f"{model_status_line(self.config)} {middle_dot()} {permission_status_line(self.permission_mode)}"
+
+    @property
+    def model_line_markup(self) -> str:
+        return f"{escaped_text(model_status_line(self.config))} {middle_dot()} {permission_status_markup(self.permission_mode)}"
+
+    @property
+    def header_markup(self) -> str:
+        return f"{escaped_text(self.title_line)}\n{self.model_line_markup}"
 
     def compose(self) -> ComposeResult:
         with Vertical(id="root"):
             with Horizontal(id="top"):
                 yield Static(MEWCODE_LOGO, id="logo")
-                yield Static(f"{self.title_line}\n{self.model_line}", id="meta")
+                yield Static(self.header_markup, id="meta")
             yield Static("─" * 120, id="divider")
             yield VerticalScroll(id="chat")
             with Container(id="input-area"):
@@ -679,8 +853,24 @@ class MewCodeApp(App[int]):
 
     def on_mount(self) -> None:
         self._append_message(DisplayMessage("status", "Ready."))
+        self._apply_permission_theme()
         self.set_interval(0.1, self._tick_spinner)
         self.call_after_refresh(self._focus_input)
+
+    def action_cycle_permission_mode(self) -> None:
+        self.permission_mode = next_permission_mode(self.permission_mode)
+        checker = getattr(self.agent, "permission_checker", None)
+        if checker is not None:
+            checker.set_mode(self.permission_mode)
+        self._apply_permission_theme()
+        self._append_status_notice(permission_mode_status_text(self.permission_mode))
+        self.call_after_refresh(self._focus_input)
+
+    def _apply_permission_theme(self) -> None:
+        self.query_one("#meta", Static).update(self.header_markup)
+        prompt = self.query_one("#prompt-input", PromptInput)
+        prompt.remove_class(*PERMISSION_THEME_CLASSES)
+        prompt.add_class(permission_theme_class(self.permission_mode))
 
     def copy_to_clipboard(self, text: str) -> None:
         if sys.platform == "win32":
@@ -707,6 +897,8 @@ class MewCodeApp(App[int]):
             widget.refresh_message()
 
     def on_key(self, event) -> None:
+        if self._handle_permission_prompt_key(event):
+            return
         if self._handle_clarification_key(event):
             return
         if isinstance(self.focused, PromptInput):
@@ -760,14 +952,14 @@ class MewCodeApp(App[int]):
         if self.pending_request is not None:
             pending = self.pending_request
             if lowered in {"y", "yes"}:
-                self.pending_request = None
-                await self._drive(lambda: self.agent.stream_confirm(self.session, pending), phase="Coding")
+                await self._resolve_permission_prompt(pending, action="allow", scope="once")
+            elif lowered in {"a", "always", "permanent", "forever"}:
+                await self._resolve_permission_prompt(pending, action="allow", scope="permanent")
             elif lowered in {"n", "no"}:
-                self.pending_request = None
-                await self._drive(lambda: self.agent.stream_deny(self.session, pending), phase="Coding")
+                await self._resolve_permission_prompt(pending, action="deny", scope="once")
             else:
-                self._append_message(DisplayMessage("assistant", "Please reply yes or no."))
-                self._begin_status(confirmation_status_text(pending.tool_call.name), phase=None)
+                self._append_message(DisplayMessage("assistant", "Please reply yes, always, or no."))
+                self._begin_status(permission_prompt_status_text(), phase=None)
                 self.call_after_refresh(self._focus_input)
             return
 
@@ -793,6 +985,8 @@ class MewCodeApp(App[int]):
         self._tool_started_at = {}
         self._clarification_state = None
         self._clarification_widget = None
+        if self._permission_prompt_state is None:
+            self._permission_prompt_widget = None
         self._begin_status(status_message_text(self.spinner_frames[self.spinner_index], phase, 0), phase=phase)
         try:
             await asyncio.to_thread(self._consume_stream, make_stream)
@@ -832,8 +1026,7 @@ class MewCodeApp(App[int]):
             self._finish_tool_status(event.tool_call, ok, detail)
             self._reply_widget = None
         elif isinstance(event, ConfirmationRequired):
-            self.pending_request = event.pending_request
-            self._finish_status(confirmation_status_text(event.pending_request.tool_call.name))
+            self._begin_permission_prompt(event.pending_request)
         elif isinstance(event, UserQuestionRequested):
             if can_use_interactive_clarification(event):
                 self._begin_clarification(event)
@@ -856,6 +1049,8 @@ class MewCodeApp(App[int]):
         self._interrupted = True
         self._clarification_state = None
         self._clarification_widget = None
+        self._permission_prompt_state = None
+        self._permission_prompt_widget = None
         self._finish_running_tool(False, message)
         self._finish_status(error_status_text(message))
 
@@ -871,6 +1066,82 @@ class MewCodeApp(App[int]):
             )
             self._status_widget.refresh_message()
         self.call_after_refresh(self._focus_input)
+
+    def _begin_permission_prompt(self, pending: PendingToolRequest) -> None:
+        self.pending_request = pending
+        state = PermissionPromptState(pending=pending)
+        self._permission_prompt_state = state
+        self._permission_prompt_widget = self._mount_before_status(
+            DisplayMessage("status", permission_prompt_panel_text(state))
+        )
+        self._finish_status(permission_prompt_status_text())
+        self.call_after_refresh(self._focus_input)
+
+    def _refresh_permission_prompt(self) -> None:
+        if self._permission_prompt_state is None or self._permission_prompt_widget is None:
+            return
+        self._permission_prompt_widget.message.content = permission_prompt_panel_text(self._permission_prompt_state)
+        self._permission_prompt_widget.refresh_message()
+        self.call_after_refresh(self._scroll_chat_end)
+
+    def _handle_permission_prompt_key(self, event) -> bool:
+        if self._permission_prompt_state is None:
+            return False
+        if event.key not in {"up", "down", "enter"}:
+            return False
+        event.stop()
+        event.prevent_default()
+        if event.key == "up":
+            self._permission_prompt_state.move(-1)
+            self._refresh_permission_prompt()
+        elif event.key == "down":
+            self._permission_prompt_state.move(1)
+            self._refresh_permission_prompt()
+        elif event.key == "enter":
+            self.run_worker(self._submit_permission_prompt(), exclusive=True, group="turn")
+        return True
+
+    async def _submit_permission_prompt(self) -> None:
+        state = self._permission_prompt_state
+        if state is None:
+            return
+        choice = state.selected_choice()
+        await self._resolve_permission_prompt(
+            state.pending,
+            action=choice.action,
+            scope=choice.scope,
+            choice=choice,
+        )
+
+    async def _resolve_permission_prompt(
+        self,
+        pending: PendingToolRequest,
+        action: str,
+        scope: str = "once",
+        choice: PermissionChoice | None = None,
+    ) -> None:
+        if choice is None:
+            choice = next(
+                (
+                    candidate
+                    for candidate in PermissionPromptState(pending=pending).choices
+                    if candidate.action == action and candidate.scope == scope
+                ),
+                None,
+            )
+        if self._permission_prompt_widget is not None and self._permission_prompt_widget.is_mounted:
+            label = choice.label if choice is not None else action
+            self._permission_prompt_widget.message.content = (
+                f"[bold green]Permission choice:[/bold green] {escaped_text(label)}"
+            )
+            self._permission_prompt_widget.refresh_message()
+        self.pending_request = None
+        self._permission_prompt_state = None
+        self._permission_prompt_widget = None
+        if action == "deny":
+            await self._drive(lambda: self.agent.stream_deny(self.session, pending), phase="Coding")
+            return
+        await self._drive(lambda: self.agent.stream_confirm(self.session, pending, scope=scope), phase="Coding")
 
     def _refresh_clarification(self) -> None:
         if self._clarification_state is None or self._clarification_widget is None:
@@ -980,6 +1251,11 @@ class MewCodeApp(App[int]):
         if self._clarification_state is not None:
             self._clarification_state = None
             self._clarification_widget = None
+            self._finish_status(interrupted_status_text(self._elapsed_seconds()))
+        if self._permission_prompt_state is not None:
+            self.pending_request = None
+            self._permission_prompt_state = None
+            self._permission_prompt_widget = None
             self._finish_status(interrupted_status_text(self._elapsed_seconds()))
         self.call_after_refresh(self._focus_input)
 
@@ -1126,6 +1402,7 @@ class MewCodeRepl:
         self.version = version
         self.pending_request: PendingToolRequest | None = None
         self.mode = "normal"
+        self.permission_mode = config.permission_mode
         self.last_plan_path: str | None = None
 
     def run(self) -> int:
@@ -1148,7 +1425,10 @@ class MewCodeRepl:
         return int(result or 0)
 
     def header_text(self) -> str:
-        return f"MewCode Agent v{self.version}  {model_status_line(self.config)}  cwd:{self.cwd}"
+        return (
+            f"MewCode Agent v{self.version}  {model_status_line(self.config)}  "
+            f"{permission_status_line(self.permission_mode)}  cwd:{self.cwd}"
+        )
 
     def _run_line_mode(self) -> int:
         self._println(self.header_text())
@@ -1169,6 +1449,25 @@ class MewCodeRepl:
                 self._println("* Error: No agent configured")
                 continue
 
+            if self.pending_request is not None:
+                pending = self.pending_request
+                lowered = content.lower()
+                if lowered in {"y", "yes"}:
+                    self.pending_request = None
+                    events = self.agent.stream_confirm(self.session, pending)
+                elif lowered in {"a", "always", "permanent", "forever"}:
+                    self.pending_request = None
+                    events = self.agent.stream_confirm(self.session, pending, scope="permanent")
+                elif lowered in {"n", "no"}:
+                    self.pending_request = None
+                    events = self.agent.stream_deny(self.session, pending)
+                else:
+                    self._println("Please reply yes, always, or no.")
+                    continue
+                for event in events:
+                    self._handle_line_event(event)
+                continue
+
             if is_accept_command(content):
                 self.mode = "normal"
                 self._println(accept_plan_status_plain(self.last_plan_path))
@@ -1184,28 +1483,7 @@ class MewCodeRepl:
 
             self._println(f"> {content}")
             for event in self._agent_stream_turn(content):
-                if isinstance(event, TextDelta):
-                    self._println(event.text)
-                elif isinstance(event, ToolStarted):
-                    self._println(f"* Running {tool_action_label(event.tool_call)}")
-                elif isinstance(event, ToolFinished):
-                    ok = bool(event.result.get("ok"))
-                    self._remember_plan_file(event.result)
-                    status = "ok" if ok else f"failed: {event.result.get('error') or event.result.get('content') or ''}"
-                    self._println(f"* {tool_action_label(event.tool_call)} {status}")
-                elif isinstance(event, UserQuestionRequested):
-                    if should_render_structured_clarification(event):
-                        self._println(clarification_questions_text(event.questions))
-                    else:
-                        self._println(question_message_text(event.question, event.options))
-                    self._println("* Waiting for your clarification. Reply with the answer to continue planning.")
-                elif isinstance(event, TurnCancelled):
-                    self._println("* Interrupted")
-                elif isinstance(event, AgentError):
-                    self._println(f"* Error: {event.message}")
-                elif isinstance(event, TurnComplete):
-                    if event.reason != "await_user":
-                        self._println(f"* Done ({event.reason})")
+                self._handle_line_event(event)
 
     def _agent_stream_turn(self, content: str) -> Iterator[AgentEvent]:
         if self.agent is None:
@@ -1214,6 +1492,33 @@ class MewCodeRepl:
             return self.agent.stream_turn(self.session, content, mode=self.mode)
         except TypeError:
             return self.agent.stream_turn(self.session, content)
+
+    def _handle_line_event(self, event: AgentEvent) -> None:
+        if isinstance(event, TextDelta):
+            self._println(event.text)
+        elif isinstance(event, ToolStarted):
+            self._println(f"* Running {tool_action_label(event.tool_call)}")
+        elif isinstance(event, ToolFinished):
+            ok = bool(event.result.get("ok"))
+            self._remember_plan_file(event.result)
+            status = "ok" if ok else f"failed: {event.result.get('error') or event.result.get('content') or ''}"
+            self._println(f"* {tool_action_label(event.tool_call)} {status}")
+        elif isinstance(event, ConfirmationRequired):
+            self.pending_request = event.pending_request
+            self._println(confirmation_status_plain(event.pending_request.tool_call.name))
+        elif isinstance(event, UserQuestionRequested):
+            if should_render_structured_clarification(event):
+                self._println(clarification_questions_text(event.questions))
+            else:
+                self._println(question_message_text(event.question, event.options))
+            self._println("* Waiting for your clarification. Reply with the answer to continue planning.")
+        elif isinstance(event, TurnCancelled):
+            self._println("* Interrupted")
+        elif isinstance(event, AgentError):
+            self._println(f"* Error: {event.message}")
+        elif isinstance(event, TurnComplete):
+            if event.reason != "await_user":
+                self._println(f"* Done ({event.reason})")
 
     def _remember_plan_file(self, result: dict) -> None:
         metadata = result.get("metadata") or {}

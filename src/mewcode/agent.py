@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from mewcode.permissions import ConfirmScope, PermissionChecker, PermissionDecision
 from mewcode.prompts import PromptPayload, assemble_api_payload
 from mewcode.providers.base import ChatProvider, ChatResponse, ProviderUsage, StreamChunk, ToolCall
 from mewcode.session import ChatSession
@@ -18,6 +19,7 @@ DEFAULT_MAX_TOOL_STEPS = 24
 @dataclass
 class PendingToolRequest:
     tool_call: ToolCall
+    decision: PermissionDecision | None = None
 
 
 @dataclass
@@ -172,11 +174,13 @@ class SingleToolAgent:
         registry: ToolRegistry,
         context: ToolContext,
         max_tool_steps: int = DEFAULT_MAX_TOOL_STEPS,
+        permission_checker: PermissionChecker | None = None,
     ) -> None:
         self.provider = provider
         self.registry = registry
         self.context = context
         self.max_tool_steps = max_tool_steps
+        self.permission_checker = permission_checker
         self._cancel_requested = False
 
     def cancel(self) -> None:
@@ -186,9 +190,14 @@ class SingleToolAgent:
         self._cancel_requested = False
 
     def run_turn(self, session: ChatSession, user_text: str, mode: AgentMode = "normal") -> AgentTurnResult:
+        history_start = len(session.messages)
         events = list(self.stream_turn(session, user_text, mode=mode))
         tool_calls = [event.tool_call for event in events if isinstance(event, ToolFinished)]
         tool_results = [event.result for event in events if isinstance(event, ToolFinished)]
+        ordered_tool_calls, ordered_tool_results = self._turn_tool_history(session, history_start)
+        if ordered_tool_calls or ordered_tool_results:
+            tool_calls = ordered_tool_calls
+            tool_results = ordered_tool_results
         stop_reason = "final"
         for event in reversed(events):
             if isinstance(event, TurnComplete):
@@ -214,8 +223,38 @@ class SingleToolAgent:
             stop_reason=stop_reason,
         )
 
-    def confirm_pending(self, session: ChatSession, pending: PendingToolRequest) -> AgentTurnResult:
-        result_payload = self._tool_result_for_call(pending.tool_call, mode="normal")
+    def _turn_tool_history(self, session: ChatSession, history_start: int) -> tuple[list[ToolCall], list[dict[str, Any]]]:
+        new_messages = session.messages[history_start:]
+        ordered_tool_calls: list[ToolCall] = []
+        ordered_tool_results: list[dict[str, Any]] = []
+
+        for message in new_messages:
+            if message.get("role") == "assistant" and message.get("tool_calls"):
+                for payload in message.get("tool_calls") or []:
+                    if not isinstance(payload, dict):
+                        continue
+                    call_id = str(payload.get("id") or "")
+                    tool_call = ToolCall(
+                        name=str(payload.get("name") or ""),
+                        arguments=dict(payload.get("arguments") or {}),
+                        id=call_id or None,
+                    )
+                    ordered_tool_calls.append(tool_call)
+                continue
+            if message.get("role") != "tool":
+                continue
+            result = message.get("tool_result")
+            if isinstance(result, dict):
+                ordered_tool_results.append(result)
+        return ordered_tool_calls, ordered_tool_results
+
+    def confirm_pending(
+        self,
+        session: ChatSession,
+        pending: PendingToolRequest,
+        scope: ConfirmScope = "once",
+    ) -> AgentTurnResult:
+        result_payload = self._confirm_tool_result(pending, scope=scope)
         session.add_tool_result(pending.tool_call.name, result_payload, tool_id=tool_call_id(pending.tool_call, 0))
         turn_result = self.run_turn(session, "", mode="normal")
         turn_result.tool_call = pending.tool_call
@@ -284,6 +323,12 @@ class SingleToolAgent:
             tool_calls = step.tool_calls[:remaining]
             session.add_tool_calls([tool_call_payload(tool_call, index) for index, tool_call in enumerate(tool_calls)])
 
+            confirmation = self._permission_confirmation(tool_calls, mode, allow_plan_file_write)
+            if confirmation is not None:
+                yield confirmation
+                yield TurnComplete("await_user")
+                return
+
             results = yield from self._execute_tool_calls(tool_calls, mode, allow_plan_file_write=allow_plan_file_write)
             for index, (tool_call, result) in enumerate(zip(tool_calls, results)):
                 session.add_tool_result(tool_call.name, result, tool_id=tool_call_id(tool_call, index))
@@ -307,9 +352,14 @@ class SingleToolAgent:
         yield TextDelta(message)
         yield TurnComplete("max_steps")
 
-    def stream_confirm(self, session: ChatSession, pending: PendingToolRequest) -> Iterator[AgentEvent]:
+    def stream_confirm(
+        self,
+        session: ChatSession,
+        pending: PendingToolRequest,
+        scope: ConfirmScope = "once",
+    ) -> Iterator[AgentEvent]:
         yield ToolStarted(pending.tool_call)
-        result = self._tool_result_for_call(pending.tool_call, mode="normal")
+        result = self._confirm_tool_result(pending, scope=scope)
         session.add_tool_result(pending.tool_call.name, result, tool_id=tool_call_id(pending.tool_call, 0))
         yield ToolFinished(pending.tool_call, result)
         yield from self.stream_turn(session, "", mode="normal")
@@ -366,33 +416,34 @@ class SingleToolAgent:
     ) -> Iterator[AgentEvent | list[dict[str, Any]]]:
         safe_calls, unsafe_calls = self.partition_tool_calls(tool_calls)
         results_by_id: dict[str, dict[str, Any]] = {}
+        original_indexes = {id(tool_call): index for index, tool_call in enumerate(tool_calls)}
 
         if safe_calls:
             for tool_call in safe_calls:
                 yield ToolStarted(tool_call)
             with ThreadPoolExecutor(max_workers=len(safe_calls)) as executor:
                 futures = {
-                    tool_call_id(tool_call, index): executor.submit(
+                    tool_call_id(tool_call, original_indexes[id(tool_call)]): executor.submit(
                         self._tool_result_for_call,
                         tool_call,
                         mode,
                         allow_plan_file_write,
                     )
-                    for index, tool_call in enumerate(safe_calls)
+                    for tool_call in safe_calls
                 }
-                for index, tool_call in enumerate(safe_calls):
+                for tool_call in safe_calls:
                     if self._cancel_requested:
                         break
-                    result = futures[tool_call_id(tool_call, index)].result()
-                    results_by_id[tool_call_id(tool_call, index)] = result
+                    result = futures[tool_call_id(tool_call, original_indexes[id(tool_call)])].result()
+                    results_by_id[tool_call_id(tool_call, original_indexes[id(tool_call)])] = result
                     yield ToolFinished(tool_call, result)
 
-        for index, tool_call in enumerate(unsafe_calls):
+        for tool_call in unsafe_calls:
             if self._cancel_requested:
                 break
             yield ToolStarted(tool_call)
             result = self._tool_result_for_call(tool_call, mode, allow_plan_file_write)
-            results_by_id[tool_call_id(tool_call, index)] = result
+            results_by_id[tool_call_id(tool_call, original_indexes[id(tool_call)])] = result
             yield ToolFinished(tool_call, result)
 
         ordered_results = [
@@ -419,6 +470,7 @@ class SingleToolAgent:
         tool_call: ToolCall,
         mode: AgentMode = "normal",
         allow_plan_file_write: bool = False,
+        skip_permission: bool = False,
     ) -> dict[str, Any]:
         try:
             tool = self.registry.get(tool_call.name)
@@ -453,11 +505,70 @@ class SingleToolAgent:
                 "error": f"Missing required arguments: {', '.join(missing)}",
                 "metadata": {"missing_arguments": missing},
             }
+
+        if self.permission_checker is not None and not skip_permission:
+            decision = self.permission_checker.check(tool_call)
+            if decision.action == "deny":
+                return self._permission_result(tool_call, decision)
+            if decision.action == "ask":
+                return self._permission_result(tool_call, decision)
         try:
             result = tool.execute(tool_call.arguments, self.context)
         except ToolError as exc:
             return {"ok": False, "error": str(exc), "content": "", "metadata": {}}
         return result.to_message_content()
+
+    def _confirm_tool_result(self, pending: PendingToolRequest, scope: ConfirmScope = "once") -> dict[str, Any]:
+        if scope == "permanent" and self.permission_checker is not None:
+            self.permission_checker.allow_permanently(pending.tool_call)
+        return self._tool_result_for_call(pending.tool_call, mode="normal", skip_permission=True)
+
+    def _permission_confirmation(
+        self,
+        tool_calls: list[ToolCall],
+        mode: AgentMode,
+        allow_plan_file_write: bool,
+    ) -> ConfirmationRequired | None:
+        if self.permission_checker is None:
+            return None
+        for tool_call in tool_calls:
+            if self._plan_mode_blocks(tool_call, mode, allow_plan_file_write):
+                continue
+            try:
+                tool = self.registry.get(tool_call.name)
+            except ToolError:
+                continue
+            missing = [name for name in tool.definition.schema.required if name not in tool_call.arguments]
+            if missing:
+                continue
+            decision = self.permission_checker.check(tool_call)
+            if decision.action == "ask":
+                return ConfirmationRequired(PendingToolRequest(tool_call=tool_call, decision=decision))
+        return None
+
+    def _permission_result(self, tool_call: ToolCall, decision: PermissionDecision) -> dict[str, Any]:
+        metadata = {
+            "blocked_by_permission": decision.action != "allow",
+            "permission_action": decision.action,
+            "permission_reason": decision.reason,
+            "tool_name": tool_call.name,
+            **decision.metadata,
+        }
+        if decision.rule is not None:
+            metadata["permission_rule"] = decision.rule.expression
+            metadata["permission_rule_source"] = decision.rule.source
+        return {"ok": False, "content": "", "error": decision.reason, "metadata": metadata}
+
+    def _plan_mode_blocks(self, tool_call: ToolCall, mode: AgentMode, allow_plan_file_write: bool) -> bool:
+        if mode != "plan":
+            return False
+        if tool_call.name == "WritePlanFile" and not allow_plan_file_write:
+            return True
+        try:
+            tool = self.registry.get(tool_call.name)
+        except ToolError:
+            return False
+        return tool.definition.requires_confirmation
 
     def _cancelled_tool_result(self, tool_call: ToolCall) -> dict[str, Any]:
         return {

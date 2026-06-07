@@ -34,6 +34,7 @@ configure_windows_console_encoding()
 
 from mewcode.agent import SingleToolAgent
 from mewcode.config import ConfigError, load_config
+from mewcode.permissions import PermissionChecker, PermissionError
 from mewcode.providers import ProviderError, create_provider
 from mewcode.repl import MewCodeRepl
 from mewcode.session import ChatSession
@@ -52,11 +53,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     session = ChatSession()
     context = ToolContext(root_dir=Path.cwd(), timeout_seconds=config.timeout_seconds)
+    try:
+        permission_checker = PermissionChecker.from_workspace(context, mode=config.permission_mode)
+    except PermissionError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     agent = SingleToolAgent(
         provider=provider,
         registry=default_registry(),
         context=context,
         max_tool_steps=config.max_tool_steps,
+        permission_checker=permission_checker,
     )
     repl = MewCodeRepl(provider=provider, config=config, session=session, agent=agent)
     return repl.run()

@@ -13,7 +13,9 @@ class ReadFileTool(Tool):
         description=(
             "Read the contents of a file in the current workspace. Use this after Glob or Grep identifies a candidate "
             "path, and before EditFile when you need to modify an existing file. Prefer ReadFile over Bash commands "
-            "like cat or type for inspecting workspace files."
+            "like cat or type for inspecting workspace files. ReadFile accepts one explicit file path, not a glob or "
+            "wildcard pattern. For environment files, try explicit names one by one, such as .env, .env.local, "
+            ".env.example, .env.development, or .env.production."
         ),
         schema=ToolSchema(
             properties={

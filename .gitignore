@@ -30,6 +30,7 @@ dist/
 .vscode/
 .idea/
 .claude/settings.local.json
+.mewcode/permissions.local.yaml
 .codex/
 
 # OS files

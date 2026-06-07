@@ -6,6 +6,8 @@ from typing import Any
 
 import yaml
 
+from mewcode.permissions import DEFAULT_PERMISSION_MODE, PermissionError, PermissionMode, validate_permission_mode
+
 
 CONFIG_PATH = Path.home() / ".mewcode" / "config.yaml"
 REQUIRED_FIELDS = ("protocol", "model", "base_url", "api_key")
@@ -24,6 +26,7 @@ class MewCodeConfig:
     thinking: dict[str, Any] = field(default_factory=dict)
     timeout_seconds: float = 60.0
     max_tool_steps: int = 24
+    permission_mode: PermissionMode = DEFAULT_PERMISSION_MODE
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -53,7 +56,7 @@ def load_config(path: Path | None = None) -> MewCodeConfig:
     extra = {
         key: value
         for key, value in raw.items()
-        if key not in {*REQUIRED_FIELDS, "thinking", "timeout_seconds", "max_tool_steps"}
+        if key not in {*REQUIRED_FIELDS, "thinking", "timeout_seconds", "max_tool_steps", "permission_mode"}
     }
     timeout = raw.get("timeout_seconds", 60.0)
     try:
@@ -73,6 +76,11 @@ def load_config(path: Path | None = None) -> MewCodeConfig:
     if not isinstance(thinking, dict):
         raise ConfigError("Config field thinking must be a mapping when provided.")
 
+    try:
+        permission_mode = validate_permission_mode(raw.get("permission_mode"))
+    except PermissionError as exc:
+        raise ConfigError(str(exc)) from exc
+
     return MewCodeConfig(
         protocol=str(raw["protocol"]),
         model=str(raw["model"]),
@@ -81,5 +89,6 @@ def load_config(path: Path | None = None) -> MewCodeConfig:
         thinking=thinking,
         timeout_seconds=timeout_seconds,
         max_tool_steps=max_tool_steps,
+        permission_mode=permission_mode,
         extra=extra,
     )
