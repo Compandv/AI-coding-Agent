@@ -13,6 +13,12 @@ from .search_tools import GlobTool, GrepTool
 class ToolRegistry:
     tools: dict[str, Tool]
 
+    def register(self, tool: Tool) -> None:
+        name = tool.definition.name
+        if name in self.tools:
+            raise ToolError(f"Tool already registered: {name}")
+        self.tools[name] = tool
+
     def get(self, name: str) -> Tool:
         try:
             return self.tools[name]

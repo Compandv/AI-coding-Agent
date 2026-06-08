@@ -34,6 +34,7 @@ configure_windows_console_encoding()
 
 from mewcode.agent import SingleToolAgent
 from mewcode.config import ConfigError, load_config
+from mewcode.mcp import MCPManager
 from mewcode.permissions import PermissionChecker, PermissionError
 from mewcode.providers import ProviderError, create_provider
 from mewcode.repl import MewCodeRepl
@@ -53,17 +54,33 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     session = ChatSession()
     context = ToolContext(root_dir=Path.cwd(), timeout_seconds=config.timeout_seconds)
+    registry = default_registry()
+    mcp_manager = MCPManager(config.mcp, timeout_seconds=config.timeout_seconds, cwd=context.root_dir)
+    mcp_manager.register_tools(registry)
+    for server_name, error in mcp_manager.errors.items():
+        print(f"Warning: MCP server {server_name} skipped: {error}", file=sys.stderr)
     try:
         permission_checker = PermissionChecker.from_workspace(context, mode=config.permission_mode)
     except PermissionError as exc:
+        mcp_manager.close()
         print(f"Error: {exc}", file=sys.stderr)
         return 1
+    permission_checker.add_read_tools(mcp_manager.read_tool_names)
     agent = SingleToolAgent(
         provider=provider,
-        registry=default_registry(),
+        registry=registry,
         context=context,
         max_tool_steps=config.max_tool_steps,
         permission_checker=permission_checker,
     )
-    repl = MewCodeRepl(provider=provider, config=config, session=session, agent=agent)
-    return repl.run()
+    repl = MewCodeRepl(
+        provider=provider,
+        config=config,
+        session=session,
+        agent=agent,
+        mcp_status_provider=mcp_manager.status_counts,
+    )
+    try:
+        return repl.run()
+    finally:
+        mcp_manager.close()

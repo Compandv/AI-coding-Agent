@@ -36,6 +36,7 @@ from mewcode.repl import (
     last_assistant_text,
     middle_dot,
     model_status_line,
+    mcp_status_line,
     permission_mode_color,
     permission_status_line,
     permission_status_markup,
@@ -47,6 +48,7 @@ from mewcode.repl import (
     status_message_text,
     tool_action_label,
     tool_result_text,
+    tool_result_updates_mcp_status,
     tool_running_text,
     transcript_text,
     user_message_text,
@@ -174,6 +176,13 @@ def test_model_status_line_mentions_model_effort_and_billing():
     assert model_status_line(config()) == f"gpt-4.1 with high effort {middle_dot()} API Usage Billing"
 
 
+def test_mcp_status_line_summarizes_lazy_connection_counts():
+    assert mcp_status_line({"configured_servers": 1, "connected_servers": 0, "registered_tools": 0}) == (
+        "MCP: 0/1 connected, 0 tools"
+    )
+    assert tool_result_updates_mcp_status({"metadata": {"activated_tools": ["context7__resolve"]}}) is True
+
+
 def test_message_markers_are_colored_and_distinct():
     assert user_message_text("hello") == "[bold blue]>[/bold blue] hello"
     assert assistant_message_text("hello") == "[bold magenta]●[/bold magenta] hello"
@@ -272,13 +281,21 @@ def test_transcript_helpers_keep_unicode_text():
 
 
 def test_textual_app_header_removes_learning_tag_and_exposes_mode_hint():
-    app = MewCodeApp(provider=FakeProvider(), config=config(), version="0.1.0")
+    app = MewCodeApp(
+        provider=FakeProvider(),
+        config=config(),
+        version="0.1.0",
+        mcp_status_provider=lambda: {"configured_servers": 1, "connected_servers": 0, "registered_tools": 0},
+    )
 
     assert app.title_line == "MewCode Agent v0.1.0"
     assert "gpt-4.1 with high effort" in app.model_line
     assert "Permission: Default" in app.model_line
-    assert f"API Usage Billing {middle_dot()} Permission: Default" in app.model_line
-    assert f"API Usage Billing {middle_dot()} [#9ca3af]Permission: Default[/#9ca3af]" in app.header_markup
+    assert f"API Usage Billing {middle_dot()} Permission: Default {middle_dot()} MCP: 0/1 connected, 0 tools" in app.model_line
+    assert (
+        f"API Usage Billing {middle_dot()} [#9ca3af]Permission: Default[/#9ca3af] "
+        f"{middle_dot()} [#22d3ee]MCP: 0/1 connected, 0 tools[/#22d3ee]"
+    ) in app.header_markup
     assert "路" not in app.header_markup
     assert "璺" not in app.header_markup
     assert permission_status_line("acceptEdits") == "Permission: Edit"
@@ -797,6 +814,47 @@ def test_line_mode_consumes_agent_events_and_reports_tool_status():
     assert "* Read src/mewcode/repl.py ok" in rendered
     assert "Read complete." in rendered
     assert "* Done (final)" in rendered
+
+
+def test_line_mode_header_and_activation_report_mcp_status():
+    status = {"configured_servers": 1, "connected_servers": 0, "registered_tools": 0}
+    tool_call = ToolCall(name="ActivateMCPServer", arguments={"server": "context7"})
+
+    def mcp_status_provider():
+        return dict(status)
+
+    class StatusUpdatingAgent(FakeAgent):
+        def stream_turn(self, session, text, mode="normal"):
+            self.calls.append({"session": session, "text": text, "mode": mode})
+            status["connected_servers"] = 1
+            status["registered_tools"] = 2
+            yield ToolStarted(tool_call=tool_call)
+            yield ToolFinished(
+                tool_call=tool_call,
+                result={
+                    "ok": True,
+                    "content": "Activated MCP server context7.",
+                    "metadata": {"activated_tools": ["context7__resolve", "context7__docs"]},
+                },
+            )
+            yield TurnComplete(reason="final")
+
+    inputs = iter(["use context7", "/quit"])
+    output = StringIO()
+    repl = MewCodeRepl(
+        provider=FakeProvider(),
+        config=config(),
+        input_func=lambda prompt: next(inputs),
+        output=output,
+        agent=StatusUpdatingAgent(),
+        mcp_status_provider=mcp_status_provider,
+    )
+
+    assert repl.run() == 0
+
+    rendered = output.getvalue()
+    assert "MCP: 0/1 connected, 0 tools" in rendered
+    assert "* MCP: 1/1 connected, 2 tools" in rendered
 
 
 def test_line_mode_plan_and_do_are_persistent_mode_switches():

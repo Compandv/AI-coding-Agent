@@ -112,6 +112,18 @@ def test_permission_modes_default_accept_edits_plan_and_bypass(tmp_path):
     assert checker(tmp_path, "bypassPermissions").check(ToolCall(name="Bash", arguments={"command": "git status"})).action == "allow"
 
 
+def test_permission_checker_treats_declared_mcp_read_tools_as_safe(tmp_path):
+    permission_checker = checker(tmp_path, "default")
+    permission_checker.add_read_tools({"github__list_issues"})
+
+    assert permission_checker.check(ToolCall(name="github__list_issues", arguments={})).action == "allow"
+    assert permission_checker.check(ToolCall(name="github__create_issue", arguments={})).action == "ask"
+    assert checker(tmp_path, "plan").check(ToolCall(name="github__create_issue", arguments={})).action == "deny"
+
+    plan_checker = checker(tmp_path, "plan")
+    plan_checker.add_read_tools({"github__list_issues"})
+    assert plan_checker.check(ToolCall(name="github__list_issues", arguments={})).action == "allow"
+
 
 def test_load_rules_file_accepts_rules_mapping(tmp_path):
     path = tmp_path / "permissions.yaml"

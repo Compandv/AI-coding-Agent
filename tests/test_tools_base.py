@@ -33,6 +33,21 @@ def test_tool_definition_includes_input_schema():
     assert "input_schema" in definition.to_model_dict()
 
 
+def test_tool_schema_can_pass_through_raw_json_schema():
+    schema = ToolSchema.from_raw(
+        {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "Search query."}},
+            "required": ["query"],
+            "additionalProperties": False,
+        }
+    )
+
+    assert schema.required == ["query"]
+    assert schema.to_model_dict()["additionalProperties"] is False
+    assert schema.to_model_dict()["properties"]["query"]["description"] == "Search query."
+
+
 def test_tool_result_keeps_error_and_metadata():
     result = ToolResult(ok=False, content="", error="boom", metadata={"path": "a.txt"})
 

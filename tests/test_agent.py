@@ -11,6 +11,9 @@ from mewcode.providers.base import ChatResponse, ToolCall
 from mewcode.session import ChatSession
 from mewcode.tools.context import ToolContext
 from mewcode.tools.registry import default_registry
+from mewcode.mcp.client import MCPClient, MCPTool
+from mewcode.mcp.jsonrpc import make_success_response
+from mewcode.mcp.tools import MCPToolWrapper
 
 
 class FakeProvider:
@@ -28,6 +31,19 @@ class NoStreamProvider(FakeProvider):
         yield from ()
 
 
+class ScriptedTransport:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.sent = []
+
+    def send(self, message):
+        self.sent.append(message)
+
+    def receive(self, timeout_seconds=None):
+        return self.responses.pop(0)
+
+    def close(self):
+        pass
 
 
 def test_agent_returns_direct_answer_without_tool(tmp_path):
@@ -509,6 +525,93 @@ def test_agent_default_max_tool_steps_is_twenty_four():
     assert DEFAULT_MAX_TOOL_STEPS == 24
 
 
+def test_agent_can_call_mcp_tool_and_continue_loop(tmp_path):
+    client = MCPClient(
+        ScriptedTransport([make_success_response(1, {"content": [{"type": "text", "text": "issue #1"}]})]),
+        "github",
+    )
+    registry = default_registry()
+    registry.register(
+        MCPToolWrapper(
+            client=client,
+            server_name="github",
+            remote_tool=MCPTool(name="list_issues", description="List issues"),
+            read_only=True,
+        )
+    )
+    provider = NoStreamProvider(
+        [
+            ChatResponse(text="", tool_call=ToolCall(name="github__list_issues", arguments={})),
+            ChatResponse(text="Found issue #1."),
+        ]
+    )
+    context = ToolContext(root_dir=tmp_path)
+    checker = PermissionChecker.from_workspace(context, mode="default", user_path=tmp_path / "missing-user.yaml")
+    checker.add_read_tools({"github__list_issues"})
+    agent = SingleToolAgent(provider=provider, registry=registry, context=context, permission_checker=checker)
+    session = ChatSession()
+
+    result = agent.run_turn(session, "list github issues")
+
+    assert result.tool_result["ok"] is True
+    assert result.tool_result["content"] == "issue #1"
+    assert result.final_text == "Found issue #1."
+
+
+def test_agent_reloads_tool_definitions_after_mcp_activation(tmp_path):
+    class DynamicTool:
+        def __init__(self):
+            from mewcode.tools import ToolDefinition, ToolResult, ToolSchema
+
+            self.definition = ToolDefinition(name="external__echo", description="Echo.", schema=ToolSchema())
+            self.result_type = ToolResult
+
+        def execute(self, arguments, context):
+            return self.result_type(ok=True, content="activated")
+
+    class ActivateTool:
+        def __init__(self, registry):
+            from mewcode.tools import ToolDefinition, ToolParameter, ToolResult, ToolSchema
+
+            self.registry = registry
+            self.result_type = ToolResult
+            self.definition = ToolDefinition(
+                name="ActivateMCPServer",
+                description="Activate.",
+                schema=ToolSchema(
+                    properties={"server": ToolParameter(type="string", description="Server name.")},
+                    required=["server"],
+                ),
+                requires_confirmation=True,
+            )
+
+        def execute(self, arguments, context):
+            self.registry.register(DynamicTool())
+            return self.result_type(ok=True, content="activated", metadata={"activated_read_tools": ["external__echo"]})
+
+    registry = default_registry()
+    registry.register(ActivateTool(registry))
+    provider = NoStreamProvider(
+        [
+            ChatResponse(text="", tool_call=ToolCall(name="ActivateMCPServer", arguments={"server": "external"})),
+            ChatResponse(text="", tool_call=ToolCall(name="external__echo", arguments={})),
+            ChatResponse(text="Done."),
+        ]
+    )
+    context = ToolContext(root_dir=tmp_path)
+    checker = PermissionChecker.from_workspace(context, mode="bypassPermissions", user_path=tmp_path / "missing-user.yaml")
+    checker.add_read_tools({"external__echo"})
+    agent = SingleToolAgent(provider=provider, registry=registry, context=context, permission_checker=checker)
+    session = ChatSession()
+
+    result = agent.run_turn(session, "activate external")
+
+    first_request_tools = {tool["name"] for tool in provider.calls[0]["tools"]}
+    second_request_tools = {tool["name"] for tool in provider.calls[1]["tools"]}
+    assert "external__echo" not in first_request_tools
+    assert "external__echo" in second_request_tools
+    assert result.final_text == "Done."
+
 
 def test_legacy_confirm_and_deny_methods_remain_callable(tmp_path):
     provider = NoStreamProvider([ChatResponse(text="Created the file."), ChatResponse(text="Denied.")])
@@ -520,3 +623,4 @@ def test_legacy_confirm_and_deny_methods_remain_callable(tmp_path):
 
     assert confirmed.tool_result["ok"] is True
     assert denied.tool_result["metadata"]["denied"] is True
+

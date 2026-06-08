@@ -1,5 +1,5 @@
 from mewcode import cli
-from mewcode.config import MewCodeConfig
+from mewcode.config import MCPConfig, MCPServerConfig, MewCodeConfig
 
 
 class FakeStream:
@@ -11,11 +11,12 @@ class FakeStream:
 
 
 class FakeRepl:
-    def __init__(self, provider, config, session, agent):
+    def __init__(self, provider, config, session, agent, **kwargs):
         self.provider = provider
         self.config = config
         self.session = session
         self.agent = agent
+        self.kwargs = kwargs
 
     def run(self):
         return 0
@@ -24,6 +25,31 @@ class FakeRepl:
 class FakeProvider:
     pass
 
+
+class FakeMCPManager:
+    instances = []
+
+    def __init__(self, config, timeout_seconds, cwd):
+        self.config = config
+        self.timeout_seconds = timeout_seconds
+        self.cwd = cwd
+        self.errors = {}
+        self.read_tool_names = {"fake__echo"}
+        self.closed = False
+        self.connected = False
+        FakeMCPManager.instances.append(self)
+
+    def connect_all(self):
+        self.connected = True
+
+    def register_tools(self, registry):
+        self.registry = registry
+
+    def status_counts(self):
+        return {"configured_servers": 1, "connected_servers": 0, "registered_tools": 0}
+
+    def close(self):
+        self.closed = True
 
 
 def test_cli_loads_config_and_runs_repl(monkeypatch, tmp_path):
@@ -38,6 +64,7 @@ def test_cli_loads_config_and_runs_repl(monkeypatch, tmp_path):
 
     monkeypatch.setattr(cli, "load_config", lambda: config)
     monkeypatch.setattr(cli, "create_provider", lambda loaded: calls.setdefault("config", loaded) or FakeProvider())
+    monkeypatch.setattr(cli, "MCPManager", FakeMCPManager)
     monkeypatch.setattr(
         cli.PermissionChecker,
         "from_workspace",
@@ -49,7 +76,15 @@ def test_cli_loads_config_and_runs_repl(monkeypatch, tmp_path):
     assert cli.main([]) == 0
     assert calls["config"] is config
     assert calls["permission"].mode == "default"
+    assert calls["permission"].read_tool_names == {"fake__echo"}
     assert calls["repl"].agent.max_tool_steps == 32
+    assert calls["repl"].kwargs["mcp_status_provider"]() == {
+        "configured_servers": 1,
+        "connected_servers": 0,
+        "registered_tools": 0,
+    }
+    assert FakeMCPManager.instances[-1].connected is False
+    assert FakeMCPManager.instances[-1].closed is True
 
 
 class FakePermissionChecker:

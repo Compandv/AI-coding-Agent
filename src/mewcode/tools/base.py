@@ -17,8 +17,19 @@ class ToolSchema:
     type: str = "object"
     properties: dict[str, ToolParameter] = field(default_factory=dict)
     required: list[str] = field(default_factory=list)
+    raw_schema: dict[str, Any] | None = None
+
+    @classmethod
+    def from_raw(cls, raw_schema: dict[str, Any]) -> "ToolSchema":
+        raw = dict(raw_schema or {"type": "object", "properties": {}, "required": []})
+        raw_required = raw.get("required") or []
+        required = [str(item) for item in raw_required] if isinstance(raw_required, list) else []
+        return cls(raw_schema=raw, required=required)
 
     def to_model_dict(self) -> dict[str, Any]:
+        if self.raw_schema is not None:
+            return dict(self.raw_schema)
+
         def parameter_dict(parameter: ToolParameter) -> dict[str, Any]:
             payload = {"type": parameter.type, "description": parameter.description}
             if parameter.items is not None:

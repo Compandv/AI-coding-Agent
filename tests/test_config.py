@@ -41,6 +41,141 @@ custom: value
     assert config.extra == {"custom": "value"}
 
 
+def test_load_config_parses_mcp_servers_and_expands_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "gh-token")
+    path = write_config(
+        tmp_path / "config.yaml",
+        """
+protocol: openai
+model: gpt-4.1
+base_url: https://api.openai.com/v1
+api_key: secret
+mcp:
+  servers:
+    github:
+      transport: stdio
+      command: npx
+      args: ["-y", "@modelcontextprotocol/server-github"]
+      env:
+        GITHUB_TOKEN: "${GITHUB_TOKEN}"
+      read_only_tools: ["list_issues"]
+    remote:
+      transport: http
+      url: "https://example.test/mcp"
+      headers:
+        Authorization: "Bearer ${GITHUB_TOKEN}"
+""",
+    )
+
+    config = load_config(path)
+
+    assert set(config.mcp.servers) == {"github", "remote"}
+    assert config.mcp.servers["github"].env == {"GITHUB_TOKEN": "gh-token"}
+    assert config.mcp.servers["github"].read_only_tools == {"list_issues"}
+    assert config.mcp.servers["remote"].headers == {"Authorization": "Bearer gh-token"}
+
+
+def test_load_config_skips_mcp_server_when_env_missing(tmp_path):
+    path = write_config(
+        tmp_path / "config.yaml",
+        """
+protocol: openai
+model: gpt-4.1
+base_url: https://api.openai.com/v1
+api_key: secret
+mcp:
+  servers:
+    github:
+      transport: stdio
+      command: npx
+      env:
+        GITHUB_TOKEN: "${MISSING_GITHUB_TOKEN}"
+""",
+    )
+
+    config = load_config(path)
+
+    assert config.mcp.servers == {}
+    assert "github" in config.mcp.skipped_servers
+    assert "MISSING_GITHUB_TOKEN" in config.mcp.skipped_servers["github"]
+
+
+def test_load_config_merges_project_mcp_servers_by_name(tmp_path):
+    user_config = write_config(
+        tmp_path / "user.yaml",
+        """
+protocol: openai
+model: gpt-4.1
+base_url: https://api.openai.com/v1
+api_key: secret
+mcp:
+  servers:
+    github:
+      transport: stdio
+      command: old
+    slack:
+      transport: http
+      url: https://slack.example.test/mcp
+""",
+    )
+    project_config = write_config(
+        tmp_path / "project.yaml",
+        """
+mcp:
+  servers:
+    github:
+      transport: stdio
+      command: new
+      read_only_tools: ["list_issues"]
+""",
+    )
+
+    config = load_config(user_config, project_path=project_config)
+
+    assert set(config.mcp.servers) == {"github", "slack"}
+    assert config.mcp.servers["github"].command == "new"
+    assert config.mcp.servers["github"].read_only_tools == {"list_issues"}
+    assert config.mcp.servers["slack"].url == "https://slack.example.test/mcp"
+
+
+def test_load_config_uses_project_mewcode_yaml_and_aliases(tmp_path, monkeypatch):
+    user_config = write_config(
+        tmp_path / "user.yaml",
+        """
+protocol: openai
+model: gpt-4.1
+base_url: https://api.openai.com/v1
+api_key: secret
+mcp_servers:
+  context7:
+    type: stdio
+    command: old-context7
+  github:
+    type: http
+    url: https://github.example.test/mcp
+""",
+    )
+    write_config(
+        tmp_path / ".mewcode.yaml",
+        """
+mcp_servers:
+  context7:
+    type: stdio
+    command: npx
+    args: ["-y", "@upstash/context7-mcp"]
+""",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("mewcode.config.CONFIG_PATH", user_config)
+
+    config = load_config()
+
+    assert set(config.mcp.servers) == {"context7", "github"}
+    assert config.mcp.servers["context7"].transport == "stdio"
+    assert config.mcp.servers["context7"].command == "npx"
+    assert config.mcp.servers["context7"].args == ["-y", "@upstash/context7-mcp"]
+    assert config.mcp.servers["github"].transport == "http"
+
 
 def test_load_config_uses_default_max_tool_steps(tmp_path):
     path = write_config(

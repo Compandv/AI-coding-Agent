@@ -216,6 +216,20 @@ def model_status_line(config: MewCodeConfig) -> str:
     return f"{config.model} with high effort {middle_dot()} API Usage Billing"
 
 
+def mcp_status_line(status: dict[str, int] | None) -> str:
+    if not status:
+        return ""
+    configured = max(0, int(status.get("configured_servers", 0)))
+    connected = max(0, int(status.get("connected_servers", 0)))
+    tools = max(0, int(status.get("registered_tools", 0)))
+    return f"MCP: {connected}/{configured} connected, {tools} tools"
+
+
+def tool_result_updates_mcp_status(result: dict) -> bool:
+    metadata = result.get("metadata") or {}
+    return "activated_tools" in metadata or bool(metadata.get("activation_failed"))
+
+
 def middle_dot() -> str:
     return chr(183)
 
@@ -794,6 +808,7 @@ class MewCodeApp(App[int]):
         agent: SingleToolAgent | None = None,
         cwd: Path | None = None,
         version: str = __version__,
+        mcp_status_provider: Callable[[], dict[str, int]] | None = None,
     ) -> None:
         super().__init__()
         self.provider = provider
@@ -802,6 +817,7 @@ class MewCodeApp(App[int]):
         self.agent = agent
         self.cwd = cwd or Path.cwd()
         self.version = version
+        self.mcp_status_provider = mcp_status_provider
         self.messages: list[DisplayMessage] = []
         self.status_started_at: float | None = None
         self.spinner_index = 0
@@ -830,11 +846,25 @@ class MewCodeApp(App[int]):
 
     @property
     def model_line(self) -> str:
-        return f"{model_status_line(self.config)} {middle_dot()} {permission_status_line(self.permission_mode)}"
+        parts = [model_status_line(self.config), permission_status_line(self.permission_mode)]
+        mcp_line = self.mcp_status_line
+        if mcp_line:
+            parts.append(mcp_line)
+        return f" {middle_dot()} ".join(parts)
 
     @property
     def model_line_markup(self) -> str:
-        return f"{escaped_text(model_status_line(self.config))} {middle_dot()} {permission_status_markup(self.permission_mode)}"
+        parts = [escaped_text(model_status_line(self.config)), permission_status_markup(self.permission_mode)]
+        mcp_line = self.mcp_status_line
+        if mcp_line:
+            parts.append(f"[#22d3ee]{escaped_text(mcp_line)}[/#22d3ee]")
+        return f" {middle_dot()} ".join(parts)
+
+    @property
+    def mcp_status_line(self) -> str:
+        if self.mcp_status_provider is None:
+            return ""
+        return mcp_status_line(self.mcp_status_provider())
 
     @property
     def header_markup(self) -> str:
@@ -867,10 +897,13 @@ class MewCodeApp(App[int]):
         self.call_after_refresh(self._focus_input)
 
     def _apply_permission_theme(self) -> None:
-        self.query_one("#meta", Static).update(self.header_markup)
+        self._refresh_header()
         prompt = self.query_one("#prompt-input", PromptInput)
         prompt.remove_class(*PERMISSION_THEME_CLASSES)
         prompt.add_class(permission_theme_class(self.permission_mode))
+
+    def _refresh_header(self) -> None:
+        self.query_one("#meta", Static).update(self.header_markup)
 
     def copy_to_clipboard(self, text: str) -> None:
         if sys.platform == "win32":
@@ -938,6 +971,7 @@ class MewCodeApp(App[int]):
             self._append_status_notice(accept_plan_status_text(self.last_plan_path))
             self.call_after_refresh(self._focus_input)
             return
+
 
         command, remainder = parse_mode_command(text)
         if command is not None:
@@ -1024,6 +1058,8 @@ class MewCodeApp(App[int]):
             self._remember_plan_file(event.result)
             detail = None if ok else str(event.result.get("error") or event.result.get("content") or "")
             self._finish_tool_status(event.tool_call, ok, detail)
+            if tool_result_updates_mcp_status(event.result):
+                self._refresh_header()
             self._reply_widget = None
         elif isinstance(event, ConfirmationRequired):
             self._begin_permission_prompt(event.pending_request)
@@ -1391,6 +1427,7 @@ class MewCodeRepl:
         output: TextIO = sys.stdout,
         cwd: Path | None = None,
         version: str = __version__,
+        mcp_status_provider: Callable[[], dict[str, int]] | None = None,
     ) -> None:
         self.provider = provider
         self.config = config
@@ -1400,6 +1437,7 @@ class MewCodeRepl:
         self.output = output
         self.cwd = cwd or Path.cwd()
         self.version = version
+        self.mcp_status_provider = mcp_status_provider
         self.pending_request: PendingToolRequest | None = None
         self.mode = "normal"
         self.permission_mode = config.permission_mode
@@ -1420,15 +1458,27 @@ class MewCodeRepl:
             agent=self.agent,
             cwd=self.cwd,
             version=self.version,
+            mcp_status_provider=self.mcp_status_provider,
         )
         result = app.run()
         return int(result or 0)
 
     def header_text(self) -> str:
-        return (
-            f"MewCode Agent v{self.version}  {model_status_line(self.config)}  "
-            f"{permission_status_line(self.permission_mode)}  cwd:{self.cwd}"
-        )
+        parts = [
+            f"MewCode Agent v{self.version}",
+            model_status_line(self.config),
+            permission_status_line(self.permission_mode),
+        ]
+        mcp_line = self._mcp_status_line()
+        if mcp_line:
+            parts.append(mcp_line)
+        parts.append(f"cwd:{self.cwd}")
+        return "  ".join(parts)
+
+    def _mcp_status_line(self) -> str:
+        if self.mcp_status_provider is None:
+            return ""
+        return mcp_status_line(self.mcp_status_provider())
 
     def _run_line_mode(self) -> int:
         self._println(self.header_text())
@@ -1503,6 +1553,10 @@ class MewCodeRepl:
             self._remember_plan_file(event.result)
             status = "ok" if ok else f"failed: {event.result.get('error') or event.result.get('content') or ''}"
             self._println(f"* {tool_action_label(event.tool_call)} {status}")
+            if tool_result_updates_mcp_status(event.result):
+                mcp_line = self._mcp_status_line()
+                if mcp_line:
+                    self._println(f"* {mcp_line}")
         elif isinstance(event, ConfirmationRequired):
             self.pending_request = event.pending_request
             self._println(confirmation_status_plain(event.pending_request.tool_call.name))

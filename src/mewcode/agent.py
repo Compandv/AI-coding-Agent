@@ -290,8 +290,6 @@ class SingleToolAgent:
         executed_steps = 0
         model_request_index = 0
         allow_plan_file_write = self._allows_plan_file_write(user_text)
-        tool_definitions = self.registry.list_definitions()
-
         while executed_steps < self.max_tool_steps:
             if self._cancel_requested:
                 yield TurnCancelled()
@@ -300,6 +298,7 @@ class SingleToolAgent:
             yield AgentStatus("Thinking")
             model_request_index += 1
             try:
+                tool_definitions = self.registry.list_definitions()
                 prompt_payload = self._prompt_payload(session, tool_definitions, mode, model_request_index)
                 step = yield from self._collect_model_step(prompt_payload)
             except Exception as exc:
@@ -331,6 +330,7 @@ class SingleToolAgent:
 
             results = yield from self._execute_tool_calls(tool_calls, mode, allow_plan_file_write=allow_plan_file_write)
             for index, (tool_call, result) in enumerate(zip(tool_calls, results)):
+                self._sync_dynamic_tool_permissions(result)
                 session.add_tool_result(tool_call.name, result, tool_id=tool_call_id(tool_call, index))
             executed_steps += len(tool_calls)
 
@@ -558,6 +558,18 @@ class SingleToolAgent:
             metadata["permission_rule"] = decision.rule.expression
             metadata["permission_rule_source"] = decision.rule.source
         return {"ok": False, "content": "", "error": decision.reason, "metadata": metadata}
+
+
+    def _sync_dynamic_tool_permissions(self, result: dict[str, Any]) -> None:
+        if self.permission_checker is None:
+            return
+        metadata = result.get("metadata") or {}
+        activated_tools = metadata.get("activated_read_tools")
+        if not isinstance(activated_tools, list):
+            return
+        read_tools = {str(tool_name) for tool_name in activated_tools if isinstance(tool_name, str)}
+        if read_tools:
+            self.permission_checker.add_read_tools(read_tools)
 
     def _plan_mode_blocks(self, tool_call: ToolCall, mode: AgentMode, allow_plan_file_write: bool) -> bool:
         if mode != "plan":

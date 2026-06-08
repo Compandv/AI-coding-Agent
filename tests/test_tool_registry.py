@@ -1,6 +1,6 @@
 import pytest
 
-from mewcode.tools.base import ToolError
+from mewcode.tools.base import Tool, ToolDefinition, ToolError, ToolResult, ToolSchema
 from mewcode.tools.registry import default_registry
 
 
@@ -56,3 +56,18 @@ def test_registry_rejects_unknown_tool():
 
     with pytest.raises(ToolError):
         registry.get("Unknown")
+
+
+def test_registry_can_register_dynamic_tool_once():
+    class DynamicTool(Tool):
+        definition = ToolDefinition(name="external__echo", description="Echo.", schema=ToolSchema())
+
+        def execute(self, arguments, context):
+            return ToolResult(ok=True, content="ok")
+
+    registry = default_registry()
+    registry.register(DynamicTool())
+
+    assert registry.get("external__echo").definition.name == "external__echo"
+    with pytest.raises(ToolError):
+        registry.register(DynamicTool())

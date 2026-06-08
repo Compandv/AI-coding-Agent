@@ -23,9 +23,9 @@ USER_PERMISSIONS_PATH = Path.home() / ".mewcode" / "permissions.yaml"
 PROJECT_PERMISSIONS_PATH = Path(".mewcode") / "permissions.yaml"
 LOCAL_PERMISSIONS_PATH = Path(".mewcode") / "permissions.local.yaml"
 
-READ_TOOLS = {"ReadFile", "Glob", "Grep", "AskUserQuestion"}
+READ_TOOLS = {"ReadFile", "Glob", "Grep", "AskUserQuestion", "ListMCPServers"}
 EDIT_TOOLS = {"WriteFile", "EditFile", "WritePlanFile"}
-UNSAFE_TOOLS = {"WriteFile", "EditFile", "WritePlanFile", "Bash"}
+UNSAFE_TOOLS = {"WriteFile", "EditFile", "WritePlanFile", "Bash", "ActivateMCPServer"}
 COMMON_ENV_FILENAMES = (".env", ".env.local", ".env.example", ".env.development", ".env.production")
 GLOB_META_CHARS = ("*", "?", "[")
 
@@ -108,6 +108,9 @@ class PermissionChecker:
     context: ToolContext
     mode: PermissionMode = DEFAULT_PERMISSION_MODE
     rules: PermissionRuleSet = field(default_factory=PermissionRuleSet)
+    read_tools: set[str] = field(default_factory=lambda: set(READ_TOOLS))
+    edit_tools: set[str] = field(default_factory=lambda: set(EDIT_TOOLS))
+    unsafe_tools: set[str] = field(default_factory=lambda: set(UNSAFE_TOOLS))
 
     @classmethod
     def from_workspace(
@@ -129,6 +132,10 @@ class PermissionChecker:
                 local_path=local_path,
             ),
         )
+
+    def add_read_tools(self, tool_names: set[str]) -> None:
+        self.read_tools.update(tool_names)
+        self.unsafe_tools.difference_update(tool_names)
 
     def set_mode(self, mode: PermissionMode) -> None:
         self.mode = validate_permission_mode(mode)
@@ -203,7 +210,7 @@ class PermissionChecker:
     def _mode_decision(self, tool_call: Any) -> PermissionDecision:
         name = tool_call.name
         if self.mode == "plan":
-            if name in READ_TOOLS:
+            if name in self.read_tools:
                 return PermissionDecision.allow("Allowed read-only tool in plan mode", allowed_by_mode=self.mode)
             return PermissionDecision.deny(
                 f"Permission mode plan blocks tool: {name}",
@@ -214,10 +221,10 @@ class PermissionChecker:
         if self.mode == "bypassPermissions":
             return PermissionDecision.allow("Allowed by bypassPermissions mode", allowed_by_mode=self.mode)
 
-        if name in READ_TOOLS:
+        if name in self.read_tools:
             return PermissionDecision.allow("Allowed safe read tool", allowed_by_mode=self.mode)
 
-        if self.mode == "acceptEdits" and name in EDIT_TOOLS:
+        if self.mode == "acceptEdits" and name in self.edit_tools:
             return PermissionDecision.allow("Allowed edit tool by acceptEdits mode", allowed_by_mode=self.mode)
 
         return PermissionDecision.ask(
