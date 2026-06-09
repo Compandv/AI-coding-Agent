@@ -11,7 +11,7 @@ from mewcode.prompts import PromptPayload
 from mewcode.session import Message
 
 from .base import ChatProvider, ChatResponse, ProviderUsage, StreamChunk, ToolCall
-from .errors import ProviderError
+from .errors import ProviderError, PromptTooLongError, is_prompt_too_long_message
 from .sse import SSEClientMixin
 
 
@@ -94,13 +94,13 @@ class OpenAIProvider(SSEClientMixin, ChatProvider):
         self, messages: list[Message] | PromptPayload, tools: list[dict[str, Any]] | None = None
     ) -> ChatResponse:
         prompt = self._prompt_payload(messages, tools=tools)
-        if prompt.tools:
-            return self._complete_chat_with_tools_stream(prompt, prompt.tools)
         payload: dict[str, Any] = {
             "model": self.config.model,
             "messages": self._messages_payload(prompt),
             "stream": False,
         }
+        if prompt.tools:
+            payload["tools"] = self._tools_payload(prompt.tools)
         if "max_tokens" in self.config.extra:
             payload["max_tokens"] = self.config.extra["max_tokens"]
 
@@ -121,7 +121,12 @@ class OpenAIProvider(SSEClientMixin, ChatProvider):
         if not choices:
             return ChatResponse(text="", usage=self._usage_from_response(data))
         message = choices[0].get("message") or {}
-        return ChatResponse(text=str(message.get("content") or ""), usage=self._usage_from_response(data))
+        tool_calls = self._tool_calls_from_message(message)
+        return ChatResponse(
+            text=str(message.get("content") or ""),
+            tool_calls=tool_calls,
+            usage=self._usage_from_response(data),
+        )
 
     def stream_response(
         self, messages: list[Message] | PromptPayload, tools: list[dict[str, Any]] | None = None
@@ -253,6 +258,35 @@ class OpenAIProvider(SSEClientMixin, ChatProvider):
             payload.append({"type": "function", "function": function})
         return payload
 
+    def _tool_calls_from_message(self, message: dict[str, Any]) -> list[ToolCall]:
+        raw_tool_calls = message.get("tool_calls") or []
+        tool_calls: list[ToolCall] = []
+        for index, raw_tool_call in enumerate(raw_tool_calls):
+            if not isinstance(raw_tool_call, dict):
+                continue
+            function = raw_tool_call.get("function") or {}
+            name = str(function.get("name") or "")
+            if not name:
+                continue
+            raw_arguments = function.get("arguments") or "{}"
+            try:
+                if isinstance(raw_arguments, str):
+                    arguments = json.loads(raw_arguments.strip() or "{}")
+                elif isinstance(raw_arguments, dict):
+                    arguments = raw_arguments
+                else:
+                    arguments = {}
+            except json.JSONDecodeError as exc:
+                raise ProviderError(f"Invalid openai tool call JSON: {exc}") from exc
+            tool_calls.append(
+                ToolCall(
+                    name=name,
+                    arguments=arguments,
+                    id=str(raw_tool_call.get("id") or f"call_{index}"),
+                )
+            )
+        return tool_calls
+
     def _messages_payload(self, prompt: PromptPayload) -> list[dict[str, Any]]:
         payload = []
         if prompt.system:
@@ -339,7 +373,11 @@ class OpenAIProvider(SSEClientMixin, ChatProvider):
         except httpx.HTTPStatusError as exc:
             if response.status_code in {401, 403}:
                 raise ProviderError("Authentication failed. Check your API key.") from exc
-            raise ProviderError(f"Provider request failed with HTTP {response.status_code}.") from exc
+            detail = _response_error_detail(response)
+            suffix = f": {detail}" if detail else "."
+            if is_prompt_too_long_message(detail):
+                raise PromptTooLongError(f"Provider request failed with HTTP {response.status_code}{suffix}") from exc
+            raise ProviderError(f"Provider request failed with HTTP {response.status_code}{suffix}") from exc
 
 
 def _int_or_none(value: Any) -> int | None:
@@ -347,3 +385,28 @@ def _int_or_none(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _response_error_detail(response: httpx.Response) -> str:
+    _ensure_response_body_loaded(response)
+    try:
+        data = response.json()
+    except ValueError:
+        text = response.text
+    else:
+        error = data.get("error") if isinstance(data, dict) else None
+        if isinstance(error, dict):
+            text = str(error.get("message") or error)
+        else:
+            text = str(data)
+    text = " ".join(text.split())
+    if len(text) > 500:
+        return text[:497] + "..."
+    return text
+
+
+def _ensure_response_body_loaded(response: httpx.Response) -> None:
+    try:
+        response.read()
+    except (httpx.HTTPError, RuntimeError):
+        pass

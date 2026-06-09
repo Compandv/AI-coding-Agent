@@ -40,6 +40,16 @@ def test_system_prompt_sorts_sections_by_priority():
     assert rendered.index("## Identity") < rendered.index("## Behavior") < rendered.index("## Output Style")
 
 
+def test_tool_usage_prompt_prefers_readfile_metadata_and_windows_safe_shell():
+    rendered = assemble_system_prompt([ToolUsageSection()])
+
+    assert "request multiple ReadFile tool calls in the same model response" in rendered
+    assert "Use ReadFile start_line/end_line for snippets or line ranges" in rendered
+    assert "After read tools, use metadata" in rendered
+    assert "Do not run Bash only to count or slice files already read" in rendered
+    assert "avoid POSIX heredocs" in rendered
+
+
 def test_system_reminder_uses_user_role_and_xml_wrapper():
     message = system_reminder_message("Stay read-only.")
 

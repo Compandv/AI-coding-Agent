@@ -192,6 +192,84 @@ api_key: secret
 
     assert config.max_tool_steps == 24
     assert config.permission_mode == "default"
+    assert config.context.context_window_tokens == 128000
+    assert config.context.single_result_byte_threshold == 50000
+
+
+def test_load_config_parses_context_management_options(tmp_path):
+    path = write_config(
+        tmp_path / "config.yaml",
+        """
+protocol: openai
+model: gpt-4.1
+base_url: https://api.openai.com/v1
+api_key: secret
+context:
+  context_window_tokens: 64000
+  auto_margin_tokens: 12000
+  manual_margin_tokens: 2000
+  single_result_bytes: 40000
+  aggregate_result_bytes: 180000
+  preview_chars: 1500
+  tool_preview_head_chars: 3000
+  tool_preview_tail_chars: 2500
+  summary_chunk_target_tokens: 9000
+  summary_chunk_max_tokens: 14000
+  compact_focus_max_chars: 800
+  cache_dir: .mewcode/custom-context
+""",
+    )
+
+    config = load_config(path)
+
+    assert config.context.context_window_tokens == 64000
+    assert config.context.auto_margin_tokens == 12000
+    assert config.context.manual_margin_tokens == 2000
+    assert config.context.single_result_byte_threshold == 40000
+    assert config.context.aggregate_result_byte_threshold == 180000
+    assert config.context.preview_chars == 1500
+    assert config.context.tool_preview_head_chars == 3000
+    assert config.context.tool_preview_tail_chars == 2500
+    assert config.context.summary_chunk_target_tokens == 9000
+    assert config.context.summary_chunk_max_tokens == 14000
+    assert config.context.compact_focus_max_chars == 800
+    assert config.context.cache_dir == ".mewcode/custom-context"
+
+
+def test_load_config_accepts_top_level_context_window(tmp_path):
+    path = write_config(
+        tmp_path / "config.yaml",
+        """
+protocol: openai
+model: gpt-4.1
+base_url: https://api.openai.com/v1
+api_key: secret
+context_window: 96000
+""",
+    )
+
+    config = load_config(path)
+
+    assert config.context.context_window_tokens == 96000
+
+
+def test_load_config_reports_invalid_context_option(tmp_path):
+    path = write_config(
+        tmp_path / "config.yaml",
+        """
+protocol: openai
+model: gpt-4.1
+base_url: https://api.openai.com/v1
+api_key: secret
+context:
+  auto_margin_tokens: 0
+""",
+    )
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(path)
+
+    assert "context.auto_margin_tokens" in str(exc_info.value)
 
 
 def test_load_config_reports_invalid_permission_mode(tmp_path):

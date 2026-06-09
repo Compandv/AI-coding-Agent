@@ -1,6 +1,6 @@
 from .anthropic import AnthropicProvider
 from .base import ChatProvider, ChatResponse, StreamChunk, ToolCall
-from .errors import ProviderError
+from .errors import PromptTooLongError, ProviderError
 from .factory import create_provider
 from .openai import OpenAIProvider
 
@@ -9,6 +9,7 @@ __all__ = [
     "ChatProvider",
     "ChatResponse",
     "OpenAIProvider",
+    "PromptTooLongError",
     "ProviderError",
     "StreamChunk",
     "ToolCall",

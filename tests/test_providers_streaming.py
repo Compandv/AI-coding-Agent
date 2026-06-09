@@ -10,12 +10,55 @@ from mewcode.providers.anthropic import (
     parse_anthropic_tool_calls_stream,
 )
 from mewcode.providers.base import ToolCall
+from mewcode.providers.errors import PromptTooLongError, ProviderError
 from mewcode.providers.openai import OpenAIProvider, parse_openai_tool_call_stream, parse_openai_tool_calls_stream
 
 
 def make_response(events):
     body = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
     return httpx.Response(200, content=body.encode("utf-8"))
+
+
+def test_openai_http_error_includes_provider_body():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": {"message": "context length exceeded"}})
+
+    config = MewCodeConfig(
+        protocol="openai",
+        model="gpt-4.1",
+        base_url="https://api.openai.com/v1",
+        api_key="sk-placeholder",
+    )
+    provider = OpenAIProvider(config, client=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    try:
+        list(provider.stream_response([{"role": "user", "content": "hello"}]))
+    except ProviderError as exc:
+        assert isinstance(exc, PromptTooLongError)
+        assert "HTTP 400: context length exceeded" in str(exc)
+    else:
+        raise AssertionError("expected ProviderError")
+
+
+def test_anthropic_http_error_includes_provider_body():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": {"message": "prompt is too long"}})
+
+    config = MewCodeConfig(
+        protocol="anthropic",
+        model="claude-sonnet-4-6",
+        base_url="https://api.anthropic.com",
+        api_key="sk-ant-placeholder",
+    )
+    provider = AnthropicProvider(config, client=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    try:
+        list(provider.stream_response([{"role": "user", "content": "hello"}]))
+    except ProviderError as exc:
+        assert isinstance(exc, PromptTooLongError)
+        assert "HTTP 400: prompt is too long" in str(exc)
+    else:
+        raise AssertionError("expected ProviderError")
 
 
 def test_anthropic_streams_text_and_sends_thinking():
@@ -70,12 +113,19 @@ def test_anthropic_omits_disabled_thinking():
 
 
 def test_anthropic_complete_chat_returns_tool_call():
+    captured = {}
+
     def handler(request: httpx.Request) -> httpx.Response:
-        return make_response([
-            {"type": "content_block_start", "content_block": {"type": "tool_use", "name": "ReadFile"}},
-            {"type": "content_block_delta", "delta": {"type": "input_json_delta", "partial_json": "{\"path\":"}},
-            {"type": "content_block_delta", "delta": {"type": "input_json_delta", "partial_json": " \"README.md\"}"}},
-        ])
+        captured["json"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "content": [
+                    {"type": "tool_use", "id": "read_1", "name": "ReadFile", "input": {"path": "README.md"}},
+                ],
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+            },
+        )
 
     config = MewCodeConfig(
         protocol="anthropic",
@@ -87,8 +137,10 @@ def test_anthropic_complete_chat_returns_tool_call():
 
     response = provider.complete_chat([{"role": "user", "content": "read readme"}], tools=[{"name": "ReadFile"}])
 
-    assert response.tool_call == ToolCall(name="ReadFile", arguments={"path": "README.md"}, id="toolu_0")
-    assert response.tool_calls == [ToolCall(name="ReadFile", arguments={"path": "README.md"}, id="toolu_0")]
+    assert captured["json"]["stream"] is False
+    assert response.tool_call == ToolCall(name="ReadFile", arguments={"path": "README.md"}, id="read_1")
+    assert response.tool_calls == [ToolCall(name="ReadFile", arguments={"path": "README.md"}, id="read_1")]
+    assert response.usage.input_tokens == 10
 
 
 def test_anthropic_tool_call_stream_parses_json_fragments():
@@ -166,11 +218,29 @@ def test_openai_streams_text_and_ignores_thinking():
 
 
 def test_openai_complete_chat_returns_tool_call():
+    captured = {}
+
     def handler(request: httpx.Request) -> httpx.Response:
-        return make_response([
-            {"choices": [{"delta": {"tool_calls": [{"function": {"name": "ReadFile", "arguments": "{\"path\":"}}]}}]},
-            {"choices": [{"delta": {"tool_calls": [{"function": {"arguments": " \"README.md\"}"}}]}}]},
-        ])
+        captured["json"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "read_1",
+                                    "type": "function",
+                                    "function": {"name": "ReadFile", "arguments": "{\"path\": \"README.md\"}"},
+                                }
+                            ]
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+            },
+        )
 
     config = MewCodeConfig(
         protocol="openai",
@@ -182,8 +252,10 @@ def test_openai_complete_chat_returns_tool_call():
 
     response = provider.complete_chat([{"role": "user", "content": "read readme"}], tools=[{"name": "ReadFile"}])
 
-    assert response.tool_call == ToolCall(name="ReadFile", arguments={"path": "README.md"}, id="call_0")
-    assert response.tool_calls == [ToolCall(name="ReadFile", arguments={"path": "README.md"}, id="call_0")]
+    assert captured["json"]["stream"] is False
+    assert response.tool_call == ToolCall(name="ReadFile", arguments={"path": "README.md"}, id="read_1")
+    assert response.tool_calls == [ToolCall(name="ReadFile", arguments={"path": "README.md"}, id="read_1")]
+    assert response.usage.input_tokens == 10
 
 
 def test_openai_tool_call_stream_uses_first_tool_call_index():

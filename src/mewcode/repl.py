@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Callable, Iterator, TextIO
 import asyncio
 import os
+import signal
 import sys
 import threading
 import time
@@ -30,11 +31,23 @@ from mewcode.agent import (
     TextDelta,
     TurnCancelled,
     ToolFinished,
+    ToolResultSpilled,
     ToolStarted,
     TurnComplete,
     UserQuestionRequested,
 )
 from mewcode.config import MewCodeConfig
+from mewcode.context import (
+    ContextChunkSummaryFinished,
+    ContextChunkSummaryStarted,
+    ContextCompressionFallbackUsed,
+    ContextCompressionFailed,
+    ContextCompressionFinished,
+    ContextCompressionSkipped,
+    ContextCompressionStarted,
+    ContextEmergencyRetry,
+    ContextStatsReported,
+)
 from mewcode.permissions import PERMISSION_MODES, PermissionMode
 from mewcode.providers import ChatProvider, ProviderError, ToolCall
 from mewcode.session import ChatSession
@@ -46,7 +59,10 @@ MEWCODE_LOGO = """███╗   ███╗
 ██║╚██╔╝██║
 ██║ ╚═╝ ██║"""
 
-FOOTER_HINT = "esc interrupt · shift+tab permission · ctrl+c copy · ctrl+y last answer · ctrl+shift+y transcript · ctrl+q quit"
+FOOTER_HINT = (
+    "esc interrupt · shift+tab permission · ctrl+c copy selection/last answer · "
+    "ctrl+y last answer · ctrl+shift+y full transcript · ctrl+q quit"
+)
 LINE_MODE_HINT = "Line UI active. Set MEWCODE_UI=tui to force Textual. "
 BRAILLE_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 ASCII_SPINNER_FRAMES = ["|", "/", "-", "\\"]
@@ -56,6 +72,8 @@ PHASE_STYLES = {
     "Thinking": "bold yellow",
     "Coding": "bold cyan",
     "Cultivating": "bold magenta",
+    "Context": "bold blue",
+    "Compacting": "bold blue",
     "Done": "bold green",
     "Error": "bold red",
     "Interrupted": "bold red",
@@ -206,6 +224,11 @@ class PromptInput(Input):
             self.replace(text, *selection)
 
     def on_key(self, event) -> None:
+        if event.key == "ctrl+c":
+            self.app.action_copy_selection_or_last_answer()
+            event.stop()
+            event.prevent_default()
+            return
         if event.key in {"shift+tab", "backtab"}:
             self.app.action_cycle_permission_mode()
             event.stop()
@@ -446,6 +469,14 @@ def tool_result_text(tool_call: ToolCall, ok: bool, elapsed_seconds: float, deta
     return f"[bold red]{TOOL_FAILED_ICON} {label} failed ({elapsed})[/bold red]"
 
 
+def tool_result_spilled_text(event: ToolResultSpilled) -> str:
+    return f"[dim]* {tool_result_spilled_plain(event)}[/dim]"
+
+
+def tool_result_spilled_plain(event: ToolResultSpilled) -> str:
+    return f"spilled {event.count} tool result(s) to disk (~{event.freed_chars} chars freed)"
+
+
 def supports_braille_spinner() -> bool:
     return False if sys.stdout.encoding is None else sys.stdout.encoding.lower().replace("-", "") == "utf8"
 
@@ -666,6 +697,156 @@ def is_accept_command(text: str) -> bool:
     return text.strip().lower() == "/accept"
 
 
+def is_compact_command(text: str) -> bool:
+    return text.strip().lower() == "/compact"
+
+
+def compact_command_focus(text: str) -> str | None:
+    stripped = text.strip()
+    lowered = stripped.lower()
+    if lowered == "/compact":
+        return ""
+    prefix = "/compact focus"
+    if lowered.startswith(f"{prefix} "):
+        return stripped[len(prefix) :].strip()
+    return None
+
+
+def is_context_command(text: str) -> bool:
+    return text.strip().lower() == "/context"
+
+
+def copy_command_target(text: str) -> str | None:
+    lowered = text.strip().lower()
+    if lowered in {"/copy", "/copy transcript"}:
+        return "transcript"
+    if lowered in {"/copy last", "/copy answer", "/copy last-answer"}:
+        return "last"
+    return None
+
+
+def context_event_text(event) -> str:
+    if isinstance(event, ContextCompressionStarted):
+        return f"[bold blue]* Compacting context ({event.kind}, before {event.before_tokens} tokens)[/bold blue]"
+    if isinstance(event, ContextChunkSummaryStarted):
+        return (
+            f"[bold blue]* Summarizing context chunk {event.chunk_index}/{event.chunk_count} "
+            f"({event.input_tokens} tokens)[/bold blue]"
+        )
+    if isinstance(event, ContextChunkSummaryFinished):
+        return (
+            f"[dim]* Context chunk {event.chunk_index}/{event.chunk_count} summarized "
+            f"({event.output_tokens} tokens)[/dim]"
+        )
+    if isinstance(event, ContextCompressionFallbackUsed):
+        suffix = (
+            f", failures: {event.consecutive_failures}"
+            if event.kind == "auto" and event.consecutive_failures
+            else ""
+        )
+        label = "Local fallback only" if event.quality == "local" else "LLM compact fallback"
+        return f"[bold yellow]* {label} ({event.kind}{suffix}): {escaped_text(event.reason)}[/bold yellow]"
+    if isinstance(event, ContextCompressionFinished):
+        return f"[dim]* {context_compacted_plain(event)}[/dim]"
+    if isinstance(event, ContextCompressionFailed):
+        suffix = f", failures: {event.consecutive_failures}" if event.consecutive_failures else ""
+        label, message, fallback = context_failure_parts(event)
+        style = "bold yellow" if fallback else "bold red"
+        return f"[{style}]* {label} ({event.kind}{suffix}): {escaped_text(message)}[/{style}]"
+    if isinstance(event, ContextCompressionSkipped):
+        return f"[bold yellow]* Context compact skipped ({event.kind}): {escaped_text(event.reason)}[/bold yellow]"
+    if isinstance(event, ContextEmergencyRetry):
+        return f"[bold yellow]* Prompt too long; compacted context and retrying once.[/bold yellow]"
+    if isinstance(event, ContextStatsReported):
+        return context_stats_text(event)
+    return ""
+
+
+def context_event_plain(event) -> str:
+    if isinstance(event, ContextCompressionStarted):
+        return f"* Compacting context ({event.kind}, before {event.before_tokens} tokens)"
+    if isinstance(event, ContextChunkSummaryStarted):
+        return (
+            f"* Summarizing context chunk {event.chunk_index}/{event.chunk_count} "
+            f"({event.input_tokens} tokens)"
+        )
+    if isinstance(event, ContextChunkSummaryFinished):
+        return f"* Context chunk {event.chunk_index}/{event.chunk_count} summarized ({event.output_tokens} tokens)"
+    if isinstance(event, ContextCompressionFallbackUsed):
+        suffix = (
+            f", failures: {event.consecutive_failures}"
+            if event.kind == "auto" and event.consecutive_failures
+            else ""
+        )
+        label = "Local fallback only" if event.quality == "local" else "LLM compact fallback"
+        return f"* {label} ({event.kind}{suffix}): {event.reason}"
+    if isinstance(event, ContextCompressionFinished):
+        return f"* {context_compacted_plain(event)}"
+    if isinstance(event, ContextCompressionFailed):
+        suffix = f", failures: {event.consecutive_failures}" if event.consecutive_failures else ""
+        label, message, _ = context_failure_parts(event)
+        return f"* {label} ({event.kind}{suffix}): {message}"
+    if isinstance(event, ContextCompressionSkipped):
+        return f"* Context compact skipped ({event.kind}): {event.reason}"
+    if isinstance(event, ContextEmergencyRetry):
+        return "* Prompt too long; compacted context and retrying once."
+    if isinstance(event, ContextStatsReported):
+        return context_stats_plain(event)
+    return ""
+
+
+def context_compacted_plain(event: ContextCompressionFinished) -> str:
+    quality = getattr(event, "summary_quality", "llm")
+    if quality == "llm":
+        label = "LLM compact succeeded"
+    elif quality == "llm_failed":
+        label = "LLM compact fallback"
+    elif quality == "local":
+        label = "Local fallback only"
+    else:
+        label = str(quality)
+    return f"Compacted: {event.before_tokens} -> {event.after_tokens} estimated tokens ({label})"
+
+
+def context_stats_plain(event: ContextStatsReported) -> str:
+    lines = [
+        "* Context stats",
+        f"- estimated tokens: {event.estimated_tokens}/{event.context_window_tokens}",
+        f"- system/prompt: {event.system_prompt_tokens}",
+        f"- tools: {event.tools_tokens}",
+        f"- user history: {event.user_history_tokens}",
+        f"- assistant history: {event.assistant_history_tokens}",
+        f"- tool results: {event.tool_result_tokens}",
+        f"- compact summary: {event.compact_summary_tokens}",
+        f"- recent raw messages: {event.recent_raw_tokens}",
+        f"- auto compact threshold: {event.auto_threshold_tokens}",
+        f"- auto compact disabled: {event.auto_compact_disabled}",
+    ]
+    if event.last_compaction_before_tokens or event.last_compaction_after_tokens:
+        lines.append(
+            f"- last compaction: {event.last_compaction_before_tokens} -> {event.last_compaction_after_tokens}"
+        )
+    return "\n".join(lines)
+
+
+def context_stats_text(event: ContextStatsReported) -> str:
+    escaped = "\n".join(escaped_text(line) for line in context_stats_plain(event).splitlines())
+    return f"[bold blue]{escaped}[/bold blue]"
+
+
+def context_failure_parts(event: ContextCompressionFailed) -> tuple[str, str, bool]:
+    fallback_prefix = "LLM compact failed; using local fallback:"
+    message = event.message.strip()
+    if message.casefold().startswith(fallback_prefix.casefold()):
+        return "LLM compact fallback", message[len(fallback_prefix) :].strip(), True
+    return "Context compact failed", message, False
+
+
+def context_running_text(event: ContextCompressionStarted, icon: str, elapsed_seconds: float) -> str:
+    elapsed = format_tool_elapsed(elapsed_seconds)
+    return f"[bold blue]{icon} Compacting context ({event.kind}, before {event.before_tokens} tokens) ({elapsed})[/bold blue]"
+
+
 def transcript_text(messages: list[DisplayMessage]) -> str:
     lines: list[str] = []
     labels = {"user": "User", "assistant": "Assistant"}
@@ -832,6 +1013,9 @@ class MewCodeApp(App[int]):
         self._tool_widgets: dict[str, ChatMessage] = {}
         self._tool_calls: dict[str, ToolCall] = {}
         self._tool_started_at: dict[str, float] = {}
+        self._context_widget: ChatMessage | None = None
+        self._context_event: ContextCompressionStarted | None = None
+        self._context_started_at: float | None = None
         self.mode = "normal"
         self.permission_mode = config.permission_mode
         self.last_plan_path: str | None = None
@@ -839,6 +1023,9 @@ class MewCodeApp(App[int]):
         self._clarification_widget: ChatMessage | None = None
         self._permission_prompt_state: PermissionPromptState | None = None
         self._permission_prompt_widget: ChatMessage | None = None
+        self._last_selection_text = ""
+        self._previous_sigint_handler = None
+        self._sigint_copy_handler_installed = False
 
     @property
     def title_line(self) -> str:
@@ -884,8 +1071,13 @@ class MewCodeApp(App[int]):
     def on_mount(self) -> None:
         self._append_message(DisplayMessage("status", "Ready."))
         self._apply_permission_theme()
+        self._install_sigint_copy_handler()
         self.set_interval(0.1, self._tick_spinner)
+        self.set_interval(0.2, self._remember_terminal_selection)
         self.call_after_refresh(self._focus_input)
+
+    def on_unmount(self) -> None:
+        self._restore_sigint_copy_handler()
 
     def action_cycle_permission_mode(self) -> None:
         self.permission_mode = next_permission_mode(self.permission_mode)
@@ -915,7 +1107,7 @@ class MewCodeApp(App[int]):
     def _tick_spinner(self) -> None:
         if not self.is_generating and self._clarification_state is None:
             return
-        if (self._status_widget is None or self._phase is None) and not self._tool_widgets:
+        if (self._status_widget is None or self._phase is None) and not self._tool_widgets and self._context_widget is None:
             return
         self.spinner_index = (self.spinner_index + 1) % len(self.spinner_frames)
         icon = self.spinner_frames[self.spinner_index]
@@ -928,6 +1120,13 @@ class MewCodeApp(App[int]):
                 continue
             widget.message.content = tool_running_text(tool_call, icon, self._tool_elapsed_seconds(key))
             widget.refresh_message()
+        if self._context_widget is not None and self._context_event is not None:
+            self._context_widget.message.content = context_running_text(
+                self._context_event,
+                icon,
+                self._context_elapsed_seconds(),
+            )
+            self._context_widget.refresh_message()
 
     def on_key(self, event) -> None:
         if self._handle_permission_prompt_key(event):
@@ -966,12 +1165,30 @@ class MewCodeApp(App[int]):
             self.call_after_refresh(self._focus_input)
             return
 
+        copy_target = copy_command_target(text)
+        if copy_target == "transcript":
+            self.action_copy_transcript()
+            self.call_after_refresh(self._focus_input)
+            return
+        if copy_target == "last":
+            self.action_copy_last_answer()
+            self.call_after_refresh(self._focus_input)
+            return
+
         if is_accept_command(text):
             self.mode = "normal"
             self._append_status_notice(accept_plan_status_text(self.last_plan_path))
             self.call_after_refresh(self._focus_input)
             return
 
+        compact_focus = compact_command_focus(text)
+        if compact_focus is not None:
+            await self._drive(lambda: self._agent_stream_compact(compact_focus), phase="Compacting")
+            return
+
+        if is_context_command(text):
+            await self._drive(self._agent_stream_context_stats, phase="Context")
+            return
 
         command, remainder = parse_mode_command(text)
         if command is not None:
@@ -1009,6 +1226,28 @@ class MewCodeApp(App[int]):
         except TypeError:
             return self.agent.stream_turn(self.session, text)
 
+    def _agent_stream_compact(self, focus: str = "") -> Iterator[AgentEvent]:
+        if self.agent is None:
+            return iter(())
+        compact = getattr(self.agent, "stream_compact", None)
+        if compact is None:
+            return iter(())
+        try:
+            return compact(self.session, focus=focus)
+        except TypeError:
+            return compact(self.session)
+
+    def _agent_stream_context_stats(self) -> Iterator[AgentEvent]:
+        if self.agent is None:
+            return iter(())
+        stats = getattr(self.agent, "stream_context_stats", None)
+        if stats is None:
+            return iter(())
+        try:
+            return stats(self.session, mode=self.mode)
+        except TypeError:
+            return stats(self.session)
+
     async def _drive(self, make_stream: Callable[[], Iterator[AgentEvent]], phase: str) -> None:
         self.is_generating = True
         self._interrupted = False
@@ -1017,6 +1256,9 @@ class MewCodeApp(App[int]):
         self._tool_widgets = {}
         self._tool_calls = {}
         self._tool_started_at = {}
+        self._context_widget = None
+        self._context_event = None
+        self._context_started_at = None
         self._clarification_state = None
         self._clarification_widget = None
         if self._permission_prompt_state is None:
@@ -1050,6 +1292,41 @@ class MewCodeApp(App[int]):
             self._scroll_chat_end()
         elif isinstance(event, AgentStatus):
             self._phase = event.phase
+        elif isinstance(event, ContextCompressionStarted):
+            self._phase = "Compacting"
+            self._begin_context_status(event)
+        elif isinstance(event, ContextChunkSummaryStarted):
+            text = context_event_text(event)
+            if text:
+                self._mount_before_status(DisplayMessage("status", text))
+        elif isinstance(event, ContextChunkSummaryFinished):
+            text = context_event_text(event)
+            if text:
+                self._mount_before_status(DisplayMessage("status", text))
+        elif isinstance(event, ContextCompressionFallbackUsed):
+            text = context_event_text(event)
+            if text:
+                self._mount_before_status(DisplayMessage("status", text))
+        elif isinstance(event, ContextCompressionFinished):
+            self._finish_context_status(context_event_text(event))
+        elif isinstance(event, ContextCompressionFailed):
+            text = context_event_text(event)
+            if text:
+                _, _, fallback = context_failure_parts(event)
+                if fallback:
+                    self._finish_context_status(text)
+                else:
+                    self._mount_before_status(DisplayMessage("status", text))
+        elif isinstance(event, ContextCompressionSkipped):
+            self._finish_context_status(context_event_text(event))
+        elif isinstance(event, ContextEmergencyRetry):
+            text = context_event_text(event)
+            if text:
+                self._mount_before_status(DisplayMessage("status", text))
+        elif isinstance(event, ContextStatsReported):
+            text = context_event_text(event)
+            if text:
+                self._mount_before_status(DisplayMessage("status", text))
         elif isinstance(event, ToolStarted):
             self._phase = "Coding"
             self._begin_tool_status(event.tool_call)
@@ -1061,6 +1338,8 @@ class MewCodeApp(App[int]):
             if tool_result_updates_mcp_status(event.result):
                 self._refresh_header()
             self._reply_widget = None
+        elif isinstance(event, ToolResultSpilled):
+            self._mount_before_status(DisplayMessage("status", tool_result_spilled_text(event)))
         elif isinstance(event, ConfirmationRequired):
             self._begin_permission_prompt(event.pending_request)
         elif isinstance(event, UserQuestionRequested):
@@ -1299,9 +1578,12 @@ class MewCodeApp(App[int]):
         self._copy_text(last_assistant_text(self.messages), "last answer")
 
     def action_copy_selection_or_last_answer(self) -> None:
-        selection = self.screen.get_selected_text()
+        selection = self._current_selection_text()
         if selection:
             self._copy_text(selection, "selection")
+            return
+        if self._last_selection_text:
+            self._copy_text(self._last_selection_text, "selection")
             return
         self._copy_text(last_assistant_text(self.messages), "last answer")
 
@@ -1314,6 +1596,43 @@ class MewCodeApp(App[int]):
             return
         self.copy_to_clipboard(text)
         self._append_status_notice(copy_status_text(label))
+
+    def _remember_terminal_selection(self) -> None:
+        selection = self._current_selection_text()
+        if selection:
+            self._last_selection_text = selection
+
+    def _current_selection_text(self) -> str:
+        try:
+            return self.screen.get_selected_text()
+        except Exception:
+            return ""
+
+    def _install_sigint_copy_handler(self) -> None:
+        try:
+            self._previous_sigint_handler = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, self._handle_sigint_copy)
+        except (OSError, ValueError):
+            return
+        self._sigint_copy_handler_installed = True
+
+    def _restore_sigint_copy_handler(self) -> None:
+        if not self._sigint_copy_handler_installed:
+            return
+        try:
+            signal.signal(signal.SIGINT, self._previous_sigint_handler)
+        except (OSError, ValueError, TypeError):
+            pass
+        self._sigint_copy_handler_installed = False
+
+    def _handle_sigint_copy(self, signum, frame) -> None:
+        try:
+            self.call_from_thread(self.action_copy_selection_or_last_answer)
+        except Exception:
+            try:
+                self.call_later(self.action_copy_selection_or_last_answer)
+            except Exception:
+                pass
 
     def _append_status_notice(self, text: str) -> None:
         if self._status_widget is not None and self._status_widget.is_mounted:
@@ -1380,6 +1699,31 @@ class MewCodeApp(App[int]):
     def _finish_running_tool(self, ok: bool, detail: str | None = None) -> None:
         for tool_call in list(self._tool_calls.values()):
             self._finish_tool_status(tool_call, ok, detail)
+        if self._context_widget is not None:
+            self._finish_context_status(interrupted_status_text(self._elapsed_seconds()))
+
+    def _begin_context_status(self, event: ContextCompressionStarted) -> None:
+        self._context_event = event
+        self._context_started_at = time.monotonic()
+        self._context_widget = self._mount_before_status(
+            DisplayMessage(
+                "status",
+                context_running_text(event, self.spinner_frames[self.spinner_index], 0.0),
+            )
+        )
+
+    def _finish_context_status(self, text: str) -> None:
+        if not text:
+            return
+        widget = self._context_widget
+        if widget is not None and widget.is_mounted:
+            widget.message.content = text
+            widget.refresh_message()
+        else:
+            self._mount_before_status(DisplayMessage("status", text))
+        self._context_widget = None
+        self._context_event = None
+        self._context_started_at = None
 
     def _remember_plan_file(self, result: dict) -> None:
         metadata = result.get("metadata") or {}
@@ -1414,6 +1758,11 @@ class MewCodeApp(App[int]):
         if started_at is None:
             return 0.0
         return time.monotonic() - started_at
+
+    def _context_elapsed_seconds(self) -> float:
+        if self._context_started_at is None:
+            return 0.0
+        return time.monotonic() - self._context_started_at
 
 
 class MewCodeRepl:
@@ -1499,6 +1848,11 @@ class MewCodeRepl:
                 self._println("* Error: No agent configured")
                 continue
 
+            copy_target = copy_command_target(content)
+            if copy_target is not None:
+                self._println("* Copy commands are available in TUI. Use terminal selection in line mode.")
+                continue
+
             if self.pending_request is not None:
                 pending = self.pending_request
                 lowered = content.lower()
@@ -1522,6 +1876,15 @@ class MewCodeRepl:
                 self.mode = "normal"
                 self._println(accept_plan_status_plain(self.last_plan_path))
                 continue
+            compact_focus = compact_command_focus(content)
+            if compact_focus is not None:
+                for event in self._agent_stream_compact(compact_focus):
+                    self._handle_line_event(event)
+                continue
+            if is_context_command(content):
+                for event in self._agent_stream_context_stats():
+                    self._handle_line_event(event)
+                continue
 
             command, remainder = parse_mode_command(content)
             if command is not None:
@@ -1543,11 +1906,50 @@ class MewCodeRepl:
         except TypeError:
             return self.agent.stream_turn(self.session, content)
 
+    def _agent_stream_compact(self, focus: str = "") -> Iterator[AgentEvent]:
+        if self.agent is None:
+            return iter(())
+        compact = getattr(self.agent, "stream_compact", None)
+        if compact is None:
+            return iter(())
+        try:
+            return compact(self.session, focus=focus)
+        except TypeError:
+            return compact(self.session)
+
+    def _agent_stream_context_stats(self) -> Iterator[AgentEvent]:
+        if self.agent is None:
+            return iter(())
+        stats = getattr(self.agent, "stream_context_stats", None)
+        if stats is None:
+            return iter(())
+        try:
+            return stats(self.session, mode=self.mode)
+        except TypeError:
+            return stats(self.session)
+
     def _handle_line_event(self, event: AgentEvent) -> None:
         if isinstance(event, TextDelta):
             self._println(event.text)
         elif isinstance(event, ToolStarted):
             self._println(f"* Running {tool_action_label(event.tool_call)}")
+        elif isinstance(
+            event,
+            (
+                ContextCompressionStarted,
+                ContextCompressionFinished,
+                ContextCompressionFailed,
+                ContextCompressionFallbackUsed,
+                ContextChunkSummaryStarted,
+                ContextChunkSummaryFinished,
+                ContextStatsReported,
+                ContextCompressionSkipped,
+                ContextEmergencyRetry,
+            ),
+        ):
+            text = context_event_plain(event)
+            if text:
+                self._println(text)
         elif isinstance(event, ToolFinished):
             ok = bool(event.result.get("ok"))
             self._remember_plan_file(event.result)
@@ -1557,6 +1959,8 @@ class MewCodeRepl:
                 mcp_line = self._mcp_status_line()
                 if mcp_line:
                     self._println(f"* {mcp_line}")
+        elif isinstance(event, ToolResultSpilled):
+            self._println(f"* {tool_result_spilled_plain(event)}")
         elif isinstance(event, ConfirmationRequired):
             self.pending_request = event.pending_request
             self._println(confirmation_status_plain(event.pending_request.tool_call.name))

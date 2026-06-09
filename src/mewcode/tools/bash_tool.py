@@ -14,8 +14,12 @@ class BashTool(Tool):
         description=(
             "Run a shell command in the current workspace when command execution is necessary, such as running tests, "
             "formatters, build commands, or project-specific scripts. Prefer Glob, Grep, ReadFile, WriteFile, and "
-            "EditFile for normal file search, inspection, and editing. Use Bash after changes when a command is the "
-            "right way to verify behavior."
+            "EditFile for normal file search, inspection, batch reading, line-range reading, and editing. Do not "
+            "use Bash or python -c just to print file snippets; use ReadFile with start_line/end_line. Use Bash "
+            "after changes when a command is the right way to verify behavior. The "
+            "command runs in the host OS shell. On Windows, avoid POSIX shell syntax such as heredocs (`<<`), cat, "
+            "grep, ls, rm, and other Unix-only forms; use dedicated tools first, then explicit Windows-compatible "
+            "commands when no dedicated tool fits."
         ),
         schema=ToolSchema(
             properties={
@@ -28,6 +32,11 @@ class BashTool(Tool):
 
     def execute(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         command = str(arguments["command"])
+        if sys.platform == "win32" and "<<" in command:
+            raise ToolError(
+                "Windows shell does not support POSIX heredoc syntax (`<<`). "
+                "Use python -c \"...\" or powershell -NoProfile -Command \"...\" instead."
+            )
         if command == "python":
             command = subprocess.list2cmdline([sys.executable])
         elif command.startswith("python "):

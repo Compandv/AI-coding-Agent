@@ -5,9 +5,22 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from mewcode.context import (
+    ContextChunkSummaryFinished,
+    ContextChunkSummaryStarted,
+    ContextCompressionFallbackUsed,
+    ContextCompressionFailed,
+    ContextCompressionFinished,
+    ContextCompressionSkipped,
+    ContextCompressionStarted,
+    ContextEmergencyRetry,
+    ContextManager,
+    ContextStatsReported,
+)
 from mewcode.permissions import ConfirmScope, PermissionChecker, PermissionDecision
 from mewcode.prompts import PromptPayload, assemble_api_payload
 from mewcode.providers.base import ChatProvider, ChatResponse, ProviderUsage, StreamChunk, ToolCall
+from mewcode.providers.errors import ProviderError
 from mewcode.session import ChatSession
 from mewcode.tools import ToolContext, ToolError, ToolRegistry
 
@@ -59,6 +72,16 @@ class ToolFinished:
 
     tool_call: ToolCall
     result: dict[str, Any]
+
+
+@dataclass
+class ToolResultSpilled:
+    """A tool result was replaced by a preview and stored on disk."""
+
+    tool_call: ToolCall
+    count: int = 1
+    freed_chars: int = 0
+    stored_path: str = ""
 
 
 @dataclass
@@ -132,9 +155,19 @@ AgentEvent = (
     | AgentStatus
     | ToolStarted
     | ToolFinished
+    | ToolResultSpilled
     | ConfirmationRequired
     | AgentError
     | PromptUsageObserved
+    | ContextCompressionStarted
+    | ContextCompressionFinished
+    | ContextCompressionFailed
+    | ContextCompressionFallbackUsed
+    | ContextChunkSummaryStarted
+    | ContextChunkSummaryFinished
+    | ContextStatsReported
+    | ContextCompressionSkipped
+    | ContextEmergencyRetry
     | UserQuestionRequested
     | TurnCancelled
     | TurnComplete
@@ -175,12 +208,14 @@ class SingleToolAgent:
         context: ToolContext,
         max_tool_steps: int = DEFAULT_MAX_TOOL_STEPS,
         permission_checker: PermissionChecker | None = None,
+        context_manager: ContextManager | None = None,
     ) -> None:
         self.provider = provider
         self.registry = registry
         self.context = context
         self.max_tool_steps = max_tool_steps
         self.permission_checker = permission_checker
+        self.context_manager = context_manager
         self._cancel_requested = False
 
     def cancel(self) -> None:
@@ -255,6 +290,7 @@ class SingleToolAgent:
         scope: ConfirmScope = "once",
     ) -> AgentTurnResult:
         result_payload = self._confirm_tool_result(pending, scope=scope)
+        result_payload = self._process_tool_result(session, pending.tool_call, result_payload, tool_call_id(pending.tool_call, 0))
         session.add_tool_result(pending.tool_call.name, result_payload, tool_id=tool_call_id(pending.tool_call, 0))
         turn_result = self.run_turn(session, "", mode="normal")
         turn_result.tool_call = pending.tool_call
@@ -270,6 +306,7 @@ class SingleToolAgent:
             "error": f"User denied execution of tool {pending.tool_call.name}.",
             "metadata": {"denied": True, "tool_name": pending.tool_call.name},
         }
+        result_payload = self._process_tool_result(session, pending.tool_call, result_payload, tool_call_id(pending.tool_call, 0))
         session.add_tool_result(pending.tool_call.name, result_payload, tool_id=tool_call_id(pending.tool_call, 0))
         turn_result = self.run_turn(session, "", mode="normal")
         turn_result.tool_call = pending.tool_call
@@ -290,17 +327,55 @@ class SingleToolAgent:
         executed_steps = 0
         model_request_index = 0
         allow_plan_file_write = self._allows_plan_file_write(user_text)
-        while executed_steps < self.max_tool_steps:
+        while True:
             if self._cancel_requested:
                 yield TurnCancelled()
                 return
 
-            yield AgentStatus("Thinking")
             model_request_index += 1
             try:
                 tool_definitions = self.registry.list_definitions()
+                if self.context_manager is not None:
+                    start_event = self.context_manager.prepare_start_event(
+                        session,
+                        tool_definitions,
+                        mode=mode,
+                        model_request_index=model_request_index,
+                    )
+                    if start_event is not None:
+                        yield start_event
+                    context_result = self.context_manager.prepare_before_request(
+                        session,
+                        tool_definitions,
+                        mode=mode,
+                        model_request_index=model_request_index,
+                        emit_started=start_event is None,
+                    )
+                    yield from context_result.events
+                    if self._cancel_requested:
+                        yield TurnCancelled()
+                        return
+                yield AgentStatus("Thinking")
                 prompt_payload = self._prompt_payload(session, tool_definitions, mode, model_request_index)
-                step = yield from self._collect_model_step(prompt_payload)
+                try:
+                    step = yield from self._collect_model_step(session, prompt_payload)
+                except Exception as exc:
+                    if self.context_manager is None or not self.context_manager.is_context_length_error(exc):
+                        raise
+                    emergency_result = self.context_manager.compact(
+                        session,
+                        tool_definitions=tool_definitions,
+                        kind="emergency",
+                        mode=mode,
+                        model_request_index=model_request_index,
+                        bypass_breaker=True,
+                    )
+                    yield from emergency_result.events
+                    if not emergency_result.compacted:
+                        raise
+                    yield ContextEmergencyRetry(str(exc))
+                    prompt_payload = self._prompt_payload(session, tool_definitions, mode, model_request_index)
+                    step = yield from self._collect_model_step(session, prompt_payload)
             except Exception as exc:
                 yield AgentError(str(exc))
                 yield TurnComplete("error")
@@ -318,8 +393,14 @@ class SingleToolAgent:
                 return
 
             self._ensure_tool_call_ids(step.tool_calls)
-            remaining = self.max_tool_steps - executed_steps
-            tool_calls = step.tool_calls[:remaining]
+            if executed_steps >= self.max_tool_steps:
+                message = f"Reached maximum tool steps ({self.max_tool_steps})."
+                session.add_assistant_message(message)
+                yield TextDelta(message)
+                yield TurnComplete("max_steps")
+                return
+
+            tool_calls = step.tool_calls
             session.add_tool_calls([tool_call_payload(tool_call, index) for index, tool_call in enumerate(tool_calls)])
 
             confirmation = self._permission_confirmation(tool_calls, mode, allow_plan_file_write)
@@ -328,11 +409,16 @@ class SingleToolAgent:
                 yield TurnComplete("await_user")
                 return
 
-            results = yield from self._execute_tool_calls(tool_calls, mode, allow_plan_file_write=allow_plan_file_write)
+            results = yield from self._execute_tool_calls(
+                session,
+                tool_calls,
+                mode,
+                allow_plan_file_write=allow_plan_file_write,
+            )
             for index, (tool_call, result) in enumerate(zip(tool_calls, results)):
                 self._sync_dynamic_tool_permissions(result)
                 session.add_tool_result(tool_call.name, result, tool_id=tool_call_id(tool_call, index))
-            executed_steps += len(tool_calls)
+            executed_steps += 1
 
             question_event = self._question_event(tool_calls, results)
             if question_event is not None:
@@ -340,17 +426,6 @@ class SingleToolAgent:
                 yield TurnComplete("await_user")
                 return
 
-            if len(step.tool_calls) > len(tool_calls) or executed_steps >= self.max_tool_steps:
-                message = f"Reached maximum tool steps ({self.max_tool_steps})."
-                session.add_assistant_message(message)
-                yield TextDelta(message)
-                yield TurnComplete("max_steps")
-                return
-
-        message = f"Reached maximum tool steps ({self.max_tool_steps})."
-        session.add_assistant_message(message)
-        yield TextDelta(message)
-        yield TurnComplete("max_steps")
 
     def stream_confirm(
         self,
@@ -360,8 +435,9 @@ class SingleToolAgent:
     ) -> Iterator[AgentEvent]:
         yield ToolStarted(pending.tool_call)
         result = self._confirm_tool_result(pending, scope=scope)
+        result = self._process_tool_result(session, pending.tool_call, result, tool_call_id(pending.tool_call, 0))
         session.add_tool_result(pending.tool_call.name, result, tool_id=tool_call_id(pending.tool_call, 0))
-        yield ToolFinished(pending.tool_call, result)
+        yield from self._tool_finished_events(pending.tool_call, result)
         yield from self.stream_turn(session, "", mode="normal")
 
     def stream_deny(self, session: ChatSession, pending: PendingToolRequest) -> Iterator[AgentEvent]:
@@ -371,25 +447,79 @@ class SingleToolAgent:
             "error": f"User denied execution of tool {pending.tool_call.name}.",
             "metadata": {"denied": True, "tool_name": pending.tool_call.name},
         }
+        result = self._process_tool_result(session, pending.tool_call, result, tool_call_id(pending.tool_call, 0))
         session.add_tool_result(pending.tool_call.name, result, tool_id=tool_call_id(pending.tool_call, 0))
-        yield ToolFinished(pending.tool_call, result)
+        yield from self._tool_finished_events(pending.tool_call, result)
         yield from self.stream_turn(session, "", mode="normal")
 
-    def _collect_model_step(self, prompt_payload: PromptPayload) -> Iterator[AgentEvent | ModelStep]:
+    def stream_compact(self, session: ChatSession, focus: str = "") -> Iterator[AgentEvent]:
+        if self.context_manager is None:
+            yield ContextCompressionSkipped(kind="manual", reason="context_manager_not_configured", before_tokens=0)
+            yield TurnComplete("compact_skipped")
+            return
+        tool_definitions = self.registry.list_definitions()
+        start_event = self.context_manager.compact_start_event(session, tool_definitions, kind="manual")
+        if start_event is not None:
+            yield start_event
+        result = self.context_manager.compact(
+            session,
+            tool_definitions=tool_definitions,
+            kind="manual",
+            focus=focus,
+            bypass_breaker=True,
+            emit_started=start_event is None,
+        )
+        yield from result.events
+        if result.failed:
+            yield TurnComplete("compact_failed")
+        elif result.skipped:
+            yield TurnComplete("compact_skipped")
+        else:
+            yield TurnComplete("compact")
+
+    def stream_context_stats(self, session: ChatSession, mode: AgentMode = "normal") -> Iterator[AgentEvent]:
+        if self.context_manager is None:
+            yield ContextCompressionSkipped(kind="manual", reason="context_manager_not_configured", before_tokens=0)
+            yield TurnComplete("context_skipped")
+            return
+        yield self.context_manager.report_stats(
+            session,
+            self.registry.list_definitions(),
+            mode=mode,
+            model_request_index=0,
+        )
+        yield TurnComplete("context")
+
+    def _collect_model_step(self, session: ChatSession, prompt_payload: PromptPayload) -> Iterator[AgentEvent | ModelStep]:
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
-        for chunk in self._stream_provider_response(prompt_payload):
-            if self._cancel_requested:
-                return ModelStep("".join(text_parts), tool_calls)
-            if chunk.text:
-                text_parts.append(chunk.text)
-                yield TextDelta(chunk.text)
-            if chunk.usage is not None:
-                yield PromptUsageObserved(chunk.usage)
-            if chunk.tool_calls:
-                tool_calls.extend(chunk.tool_calls)
-            elif chunk.tool_call is not None:
-                tool_calls.append(chunk.tool_call)
+        try:
+            for chunk in self._stream_provider_response(prompt_payload):
+                if self._cancel_requested:
+                    return ModelStep("".join(text_parts), tool_calls)
+                if chunk.text:
+                    text_parts.append(chunk.text)
+                    yield TextDelta(chunk.text)
+                if chunk.usage is not None:
+                    if self.context_manager is not None:
+                        self.context_manager.record_usage(session, chunk.usage)
+                    yield PromptUsageObserved(chunk.usage)
+                if chunk.tool_calls:
+                    tool_calls.extend(chunk.tool_calls)
+                elif chunk.tool_call is not None:
+                    tool_calls.append(chunk.tool_call)
+        except ProviderError:
+            if text_parts or tool_calls:
+                raise
+            response = self.provider.complete_chat(prompt_payload, tools=prompt_payload.tools)
+            if response.text:
+                text_parts.append(response.text)
+                yield TextDelta(response.text)
+            if response.usage is not None:
+                if self.context_manager is not None:
+                    self.context_manager.record_usage(session, response.usage)
+                yield PromptUsageObserved(response.usage)
+            tool_calls.extend(response.tool_calls)
         return ModelStep("".join(text_parts), self._dedupe_tool_calls(tool_calls))
 
     def _stream_provider_response(
@@ -410,6 +540,7 @@ class SingleToolAgent:
 
     def _execute_tool_calls(
         self,
+        session: ChatSession,
         tool_calls: list[ToolCall],
         mode: AgentMode,
         allow_plan_file_write: bool = False,
@@ -435,22 +566,73 @@ class SingleToolAgent:
                     if self._cancel_requested:
                         break
                     result = futures[tool_call_id(tool_call, original_indexes[id(tool_call)])].result()
+                    result = self._process_tool_result(
+                        session,
+                        tool_call,
+                        result,
+                        tool_call_id(tool_call, original_indexes[id(tool_call)]),
+                    )
                     results_by_id[tool_call_id(tool_call, original_indexes[id(tool_call)])] = result
-                    yield ToolFinished(tool_call, result)
+                    yield from self._tool_finished_events(tool_call, result)
 
         for tool_call in unsafe_calls:
             if self._cancel_requested:
                 break
             yield ToolStarted(tool_call)
             result = self._tool_result_for_call(tool_call, mode, allow_plan_file_write)
+            result = self._process_tool_result(
+                session,
+                tool_call,
+                result,
+                tool_call_id(tool_call, original_indexes[id(tool_call)]),
+            )
             results_by_id[tool_call_id(tool_call, original_indexes[id(tool_call)])] = result
-            yield ToolFinished(tool_call, result)
+            yield from self._tool_finished_events(tool_call, result)
 
         ordered_results = [
             results_by_id.get(tool_call_id(tool_call, index), self._cancelled_tool_result(tool_call))
             for index, tool_call in enumerate(tool_calls)
         ]
         return ordered_results
+
+    def _process_tool_result(
+        self,
+        session: ChatSession,
+        tool_call: ToolCall,
+        result: dict[str, Any],
+        tool_id: str | None = None,
+    ) -> dict[str, Any]:
+        if self.context_manager is None:
+            return result
+        return self.context_manager.process_tool_result(session, tool_call, result, tool_id)
+
+    def _tool_finished_events(self, tool_call: ToolCall, result: dict[str, Any]) -> Iterator[AgentEvent]:
+        yield ToolFinished(tool_call, result)
+        spill_event = self._tool_result_spill_event(tool_call, result)
+        if spill_event is not None:
+            yield spill_event
+
+    def _tool_result_spill_event(self, tool_call: ToolCall, result: dict[str, Any]) -> ToolResultSpilled | None:
+        metadata = result.get("metadata") or {}
+        if not metadata.get("stored_on_disk"):
+            return None
+        freed_chars = self._metadata_int(metadata, "spilled_freed_chars")
+        if freed_chars <= 0:
+            freed_chars = self._metadata_int(metadata, "original_result_chars")
+        if freed_chars <= 0:
+            freed_chars = self._metadata_int(metadata, "original_result_bytes")
+        return ToolResultSpilled(
+            tool_call=tool_call,
+            count=1,
+            freed_chars=max(0, freed_chars),
+            stored_path=str(metadata.get("stored_path") or ""),
+        )
+
+    def _metadata_int(self, metadata: dict[str, Any], key: str) -> int:
+        try:
+            return int(metadata.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
 
     def partition_tool_calls(self, tool_calls: list[ToolCall]) -> tuple[list[ToolCall], list[ToolCall]]:
         safe: list[ToolCall] = []
@@ -515,7 +697,14 @@ class SingleToolAgent:
         try:
             result = tool.execute(tool_call.arguments, self.context)
         except ToolError as exc:
-            return {"ok": False, "error": str(exc), "content": "", "metadata": {}}
+            return {"ok": False, "error": str(exc), "content": "", "metadata": {"tool_name": tool_call.name}}
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"Tool execution failed: {exc}",
+                "content": "",
+                "metadata": {"tool_name": tool_call.name, "unexpected_tool_error": True},
+            }
         return result.to_message_content()
 
     def _confirm_tool_result(self, pending: PendingToolRequest, scope: ConfirmScope = "once") -> dict[str, Any]:
@@ -558,7 +747,6 @@ class SingleToolAgent:
             metadata["permission_rule"] = decision.rule.expression
             metadata["permission_rule_source"] = decision.rule.source
         return {"ok": False, "content": "", "error": decision.reason, "metadata": metadata}
-
 
     def _sync_dynamic_tool_permissions(self, result: dict[str, Any]) -> None:
         if self.permission_checker is None:

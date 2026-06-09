@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import random
+import secrets
+import time
 from typing import Any, Literal, TypedDict
 
 
@@ -20,9 +23,11 @@ class Message(TypedDict, total=False):
 @dataclass
 class ChatSession:
     messages: list[Message]
+    session_id: str
 
     def __init__(self) -> None:
         self.messages = []
+        self.session_id = new_session_id()
 
     def add_user_message(self, content: str) -> None:
         self.messages.append({"role": "user", "content": content})
@@ -47,3 +52,11 @@ class ChatSession:
 
     def snapshot(self) -> list[Message]:
         return [message.copy() for message in self.messages]
+
+
+def new_session_id() -> str:
+    try:
+        suffix = secrets.token_hex(4)
+    except Exception:
+        suffix = random.Random(time.time()).randbytes(4).hex()
+    return f"{int(time.time())}-{suffix}"

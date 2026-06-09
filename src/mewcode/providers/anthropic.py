@@ -11,7 +11,7 @@ from mewcode.prompts import PromptPayload
 from mewcode.session import Message
 
 from .base import ChatProvider, ChatResponse, ProviderUsage, StreamChunk, ToolCall
-from .errors import ProviderError
+from .errors import ProviderError, PromptTooLongError, is_prompt_too_long_message
 from .sse import SSEClientMixin
 
 
@@ -104,14 +104,14 @@ class AnthropicProvider(SSEClientMixin, ChatProvider):
         self, messages: list[Message] | PromptPayload, tools: list[dict[str, Any]] | None = None
     ) -> ChatResponse:
         prompt = self._prompt_payload(messages, tools=tools)
-        if prompt.tools:
-            return self._complete_chat_with_tools_stream(prompt, prompt.tools)
         payload: dict[str, Any] = {
             "model": self.config.model,
             "messages": self._messages_payload(prompt),
             "stream": False,
             "max_tokens": int(self.config.extra.get("max_tokens", 4096)),
         }
+        if prompt.tools:
+            payload["tools"] = self._tools_payload(prompt)
         self._add_system_payload(payload, prompt)
         thinking = self._thinking_payload()
         if thinking:
@@ -130,8 +130,9 @@ class AnthropicProvider(SSEClientMixin, ChatProvider):
             raise ProviderError(f"Network or connection failed: {exc}") from exc
 
         data = response.json()
-        text = "".join(block.get("text", "") for block in data.get("content", []) if block.get("type") == "text")
-        return ChatResponse(text=text, usage=self._usage_from_response(data))
+        content = data.get("content") or []
+        text = "".join(block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text")
+        return ChatResponse(text=text, tool_calls=self._tool_calls_from_content(content), usage=self._usage_from_response(data))
 
     def stream_response(
         self, messages: list[Message] | PromptPayload, tools: list[dict[str, Any]] | None = None
@@ -273,6 +274,27 @@ class AnthropicProvider(SSEClientMixin, ChatProvider):
             tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
         return tools
 
+    def _tool_calls_from_content(self, content: Any) -> list[ToolCall]:
+        if not isinstance(content, list):
+            return []
+        tool_calls: list[ToolCall] = []
+        for index, block in enumerate(content):
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            name = str(block.get("name") or "")
+            if not name:
+                continue
+            raw_input = block.get("input") or {}
+            arguments = raw_input if isinstance(raw_input, dict) else {}
+            tool_calls.append(
+                ToolCall(
+                    name=name,
+                    arguments=arguments,
+                    id=str(block.get("id") or f"toolu_{index}"),
+                )
+            )
+        return tool_calls
+
     def _messages_payload(self, prompt: PromptPayload) -> list[dict[str, Any]]:
         payload = []
         for message in prompt.messages:
@@ -369,7 +391,11 @@ class AnthropicProvider(SSEClientMixin, ChatProvider):
         except httpx.HTTPStatusError as exc:
             if response.status_code in {401, 403}:
                 raise ProviderError("Authentication failed. Check your API key.") from exc
-            raise ProviderError(f"Provider request failed with HTTP {response.status_code}.") from exc
+            detail = _response_error_detail(response)
+            suffix = f": {detail}" if detail else "."
+            if is_prompt_too_long_message(detail):
+                raise PromptTooLongError(f"Provider request failed with HTTP {response.status_code}{suffix}") from exc
+            raise ProviderError(f"Provider request failed with HTTP {response.status_code}{suffix}") from exc
 
 
 def _int_or_none(value: Any) -> int | None:
@@ -377,3 +403,28 @@ def _int_or_none(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _response_error_detail(response: httpx.Response) -> str:
+    _ensure_response_body_loaded(response)
+    try:
+        data = response.json()
+    except ValueError:
+        text = response.text
+    else:
+        error = data.get("error") if isinstance(data, dict) else None
+        if isinstance(error, dict):
+            text = str(error.get("message") or error)
+        else:
+            text = str(data)
+    text = " ".join(text.split())
+    if len(text) > 500:
+        return text[:497] + "..."
+    return text
+
+
+def _ensure_response_body_loaded(response: httpx.Response) -> None:
+    try:
+        response.read()
+    except (httpx.HTTPError, RuntimeError):
+        pass

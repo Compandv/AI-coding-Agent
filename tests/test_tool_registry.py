@@ -33,9 +33,13 @@ def test_registry_prompts_glob_and_grep_more_explicitly():
     assert "Prefer Grep over Bash" in definitions["Grep"]["description"]
     assert "Required. Text to search for inside files." in definitions["Grep"]["input_schema"]["properties"]["query"]["description"]
     assert "before EditFile" in definitions["ReadFile"]["description"]
+    assert "start_line" in definitions["ReadFile"]["description"]
+    assert "end_line" in definitions["ReadFile"]["input_schema"]["properties"]
     assert "Read the target file first" in definitions["EditFile"]["description"]
     assert "Create or overwrite" in definitions["WriteFile"]["description"]
     assert "Prefer Glob, Grep, ReadFile, WriteFile, and EditFile" in definitions["Bash"]["description"]
+    assert "Do not use Bash or python -c just to print file snippets" in definitions["Bash"]["description"]
+    assert "avoid POSIX shell syntax such as heredocs" in definitions["Bash"]["description"]
 
 
 def test_registry_ask_user_question_options_support_custom_other():

@@ -1,4 +1,5 @@
 import asyncio
+import signal
 from io import StringIO
 from pathlib import Path
 
@@ -10,10 +11,18 @@ from mewcode.agent import (
     AgentTurnResult,
     ClarificationQuestion,
     ConfirmationRequired,
+    ContextChunkSummaryFinished,
+    ContextChunkSummaryStarted,
+    ContextCompressionFallbackUsed,
+    ContextCompressionFailed,
+    ContextCompressionFinished,
+    ContextCompressionStarted,
+    ContextStatsReported,
     PendingToolRequest,
     QuestionOption,
     TextDelta,
     ToolFinished,
+    ToolResultSpilled,
     ToolStarted,
     TurnComplete,
     UserQuestionRequested,
@@ -31,7 +40,13 @@ from mewcode.repl import (
     assistant_message_renderable,
     assistant_message_text,
     clarification_questions_text,
+    compact_command_focus,
     confirmation_status_text,
+    context_event_plain,
+    context_event_text,
+    copy_command_target,
+    context_running_text,
+    is_context_command,
     interrupted_status_text,
     last_assistant_text,
     middle_dot,
@@ -46,8 +61,11 @@ from mewcode.repl import (
     should_use_line_mode_for_terminal,
     spinner_frames,
     status_message_text,
+    context_compacted_plain,
     tool_action_label,
     tool_result_text,
+    tool_result_spilled_plain,
+    tool_result_spilled_text,
     tool_result_updates_mcp_status,
     tool_running_text,
     transcript_text,
@@ -61,14 +79,17 @@ class FakeProvider:
 
 
 class FakeAgent:
-    def __init__(self, result=None, confirm_result=None, deny_result=None, stream_events=None):
+    def __init__(self, result=None, confirm_result=None, deny_result=None, stream_events=None, compact_events=None):
         self.result = result
         self.confirm_result = confirm_result
         self.deny_result = deny_result
         self.stream_events = stream_events
+        self.compact_events = compact_events
         self.calls = []
         self.confirm_calls = []
         self.deny_calls = []
+        self.compact_calls = []
+        self.context_stats_calls = []
 
     def _events_for(self, result):
         if self.stream_events is not None:
@@ -105,6 +126,29 @@ class FakeAgent:
     def stream_deny(self, session, pending):
         self.deny_calls.append({"session": session, "pending": pending})
         yield from self._events_for(self.deny_result)
+
+    def stream_compact(self, session, focus=""):
+        self.compact_calls.append({"session": session, "focus": focus})
+        yield from (self.compact_events or [TurnComplete(reason="compact")])
+
+    def stream_context_stats(self, session, mode="normal"):
+        self.context_stats_calls.append({"session": session, "mode": mode})
+        yield ContextStatsReported(
+            estimated_tokens=1200,
+            system_prompt_tokens=200,
+            tools_tokens=100,
+            user_history_tokens=300,
+            assistant_history_tokens=150,
+            tool_result_tokens=250,
+            compact_summary_tokens=50,
+            recent_raw_tokens=500,
+            auto_threshold_tokens=100000,
+            context_window_tokens=128000,
+            auto_compact_disabled=False,
+            last_compaction_before_tokens=1000,
+            last_compaction_after_tokens=600,
+        )
+        yield TurnComplete(reason="context")
 
 
 class SequencedStreamAgent:
@@ -303,7 +347,8 @@ def test_textual_app_header_removes_learning_tag_and_exposes_mode_hint():
     assert permission_status_markup("bypassPermissions") == "[bold #f97316]Permission: ⚠ Bypass[/bold #f97316]"
     assert permission_mode_color("plan") == "#a855f7"
     assert FOOTER_HINT == (
-        "esc interrupt · shift+tab permission · ctrl+c copy · ctrl+y last answer · ctrl+shift+y transcript · ctrl+q quit"
+        "esc interrupt · shift+tab permission · ctrl+c copy selection/last answer · "
+        "ctrl+y last answer · ctrl+shift+y full transcript · ctrl+q quit"
     )
 
 
@@ -768,6 +813,56 @@ def test_textual_ctrl_c_copies_selection_when_textual_receives_key(monkeypatch):
     asyncio.run(run_app())
 
 
+def test_textual_ctrl_c_uses_cached_selection_after_scroll_clears_terminal_selection(monkeypatch):
+    copied = []
+
+    async def run_app() -> None:
+        app = MewCodeApp(provider=FakeProvider(), config=config(), version="0.1.0")
+        selection = {"text": "long selected text"}
+        monkeypatch.setattr("mewcode.repl.set_system_clipboard_text", lambda text: copied.append(text) or True)
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            monkeypatch.setattr(app.screen, "get_selected_text", lambda: selection["text"])
+            app._remember_terminal_selection()
+            selection["text"] = ""
+
+            await pilot.press("ctrl+c")
+            await pilot.pause()
+
+            assert app.clipboard == "long selected text"
+            assert copied == ["long selected text"]
+
+    asyncio.run(run_app())
+
+
+def test_textual_sigint_copies_instead_of_quitting(monkeypatch):
+    copied = []
+
+    async def run_app() -> None:
+        agent = FakeAgent(result=AgentTurnResult(final_text="answer"))
+        app = MewCodeApp(provider=FakeProvider(), config=config(), version="0.1.0", agent=agent)
+        monkeypatch.setattr("mewcode.repl.set_system_clipboard_text", lambda text: copied.append(text) or True)
+
+        async with app.run_test() as pilot:
+            prompt = app.query_one("#prompt-input", Input)
+            await pilot.pause()
+            prompt.value = "question"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            callbacks = []
+            monkeypatch.setattr(app, "call_from_thread", lambda callback: callbacks.append(callback) or callback())
+            app._handle_sigint_copy(signal.SIGINT, None)
+            await pilot.pause()
+
+            assert callbacks
+            assert app.clipboard == "answer"
+            assert copied == ["answer"]
+
+    asyncio.run(run_app())
+
+
 def test_textual_can_copy_transcript_without_terminal_selection(monkeypatch):
     copied = []
 
@@ -788,6 +883,31 @@ def test_textual_can_copy_transcript_without_terminal_selection(monkeypatch):
 
             assert app.clipboard == "User: 问题\n\nAssistant: 中文回答"
             assert copied == ["User: 问题\n\nAssistant: 中文回答"]
+
+    asyncio.run(run_app())
+
+
+def test_textual_copy_transcript_command(monkeypatch):
+    copied = []
+
+    async def run_app() -> None:
+        agent = FakeAgent(result=AgentTurnResult(final_text="answer"))
+        app = MewCodeApp(provider=FakeProvider(), config=config(), version="0.1.0", agent=agent)
+        monkeypatch.setattr("mewcode.repl.set_system_clipboard_text", lambda text: copied.append(text) or True)
+
+        async with app.run_test() as pilot:
+            prompt = app.query_one("#prompt-input", Input)
+            await pilot.pause()
+            prompt.value = "question"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            prompt.value = "/copy transcript"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert app.clipboard == "User: question\n\nAssistant: answer"
+            assert copied == ["User: question\n\nAssistant: answer"]
 
     asyncio.run(run_app())
 
@@ -814,6 +934,43 @@ def test_line_mode_consumes_agent_events_and_reports_tool_status():
     assert "* Read src/mewcode/repl.py ok" in rendered
     assert "Read complete." in rendered
     assert "* Done (final)" in rendered
+
+
+def test_line_mode_reports_tool_result_spill_hint():
+    tool_call = ToolCall(name="ReadFile", arguments={"path": "large.txt"})
+    agent = FakeAgent(
+        stream_events=[
+            ToolStarted(tool_call=tool_call),
+            ToolFinished(
+                tool_call=tool_call,
+                result={
+                    "ok": True,
+                    "content": "preview",
+                    "metadata": {
+                        "stored_on_disk": True,
+                        "stored_path": ".mewcode/context/session/tool-results/read.json",
+                        "spilled_freed_chars": 5598,
+                    },
+                },
+            ),
+            ToolResultSpilled(
+                tool_call=tool_call,
+                count=1,
+                freed_chars=5598,
+                stored_path=".mewcode/context/session/tool-results/read.json",
+            ),
+            TurnComplete(reason="final"),
+        ]
+    )
+    inputs = iter(["read large", "/quit"])
+    output = StringIO()
+    repl = MewCodeRepl(provider=FakeProvider(), config=config(), input_func=lambda prompt: next(inputs), output=output, agent=agent)
+
+    assert repl.run() == 0
+
+    rendered = output.getvalue()
+    assert "* Read large.txt ok" in rendered
+    assert "* spilled 1 tool result(s) to disk (~5598 chars freed)" in rendered
 
 
 def test_line_mode_header_and_activation_report_mcp_status():
@@ -872,6 +1029,93 @@ def test_line_mode_plan_and_do_are_persistent_mode_switches():
     rendered = output.getvalue()
     assert "* Plan Mode: read-only tools enabled. Use /do to execute changes." in rendered
     assert "* Do Mode: tools can write files and run commands. Use /plan for read-only planning." in rendered
+
+
+def test_line_mode_compact_command_streams_context_events():
+    agent = FakeAgent(
+        compact_events=[
+            ContextCompressionStarted(kind="manual", before_tokens=1000),
+            ContextCompressionFinished(kind="manual", before_tokens=1000, after_tokens=400, reduced_tokens=600),
+            TurnComplete(reason="compact"),
+        ]
+    )
+    inputs = iter(["/compact", "/quit"])
+    output = StringIO()
+    repl = MewCodeRepl(provider=FakeProvider(), config=config(), input_func=lambda prompt: next(inputs), output=output, agent=agent)
+
+    assert repl.run() == 0
+
+    rendered = output.getvalue()
+    assert agent.compact_calls == [{"session": repl.session, "focus": ""}]
+    assert "* Compacting context (manual, before 1000 tokens)" in rendered
+    assert "* Compacted: 1000 -> 400 estimated tokens (LLM compact succeeded)" in rendered
+    assert "* Done (compact)" in rendered
+
+
+def test_line_mode_compact_focus_passes_focus_text():
+    agent = FakeAgent(
+        compact_events=[
+            ContextCompressionFinished(kind="manual", before_tokens=1000, after_tokens=400, reduced_tokens=600),
+            TurnComplete(reason="compact"),
+        ]
+    )
+    inputs = iter(["/compact focus keep context.py details", "/quit"])
+    output = StringIO()
+    repl = MewCodeRepl(provider=FakeProvider(), config=config(), input_func=lambda prompt: next(inputs), output=output, agent=agent)
+
+    assert repl.run() == 0
+
+    assert compact_command_focus("/compact") == ""
+    assert compact_command_focus("/compact focus keep context.py details") == "keep context.py details"
+    assert compact_command_focus("/compact nope") is None
+    assert agent.compact_calls == [{"session": repl.session, "focus": "keep context.py details"}]
+
+
+def test_line_mode_manual_compact_fallback_is_not_duplicated():
+    agent = FakeAgent(
+        compact_events=[
+            ContextCompressionFallbackUsed(
+                kind="manual",
+                reason="Network or connection failed: The read operation timed out",
+                quality="llm_failed",
+                consecutive_failures=1,
+            ),
+            ContextCompressionFinished(
+                kind="manual",
+                before_tokens=43872,
+                after_tokens=16352,
+                reduced_tokens=27420,
+                summary_quality="llm_failed",
+            ),
+            TurnComplete(reason="compact"),
+        ]
+    )
+    inputs = iter(["/compact focus keep context.py details", "/quit"])
+    output = StringIO()
+    repl = MewCodeRepl(provider=FakeProvider(), config=config(), input_func=lambda prompt: next(inputs), output=output, agent=agent)
+
+    assert repl.run() == 0
+
+    rendered = output.getvalue()
+    assert rendered.count("LLM compact fallback") == 2
+    assert "* LLM compact fallback (manual): Network or connection failed: The read operation timed out" in rendered
+    assert "manual, failures" not in rendered
+
+
+def test_line_mode_context_command_reports_context_stats():
+    agent = FakeAgent()
+    inputs = iter(["/context", "/quit"])
+    output = StringIO()
+    repl = MewCodeRepl(provider=FakeProvider(), config=config(), input_func=lambda prompt: next(inputs), output=output, agent=agent)
+
+    assert repl.run() == 0
+
+    rendered = output.getvalue()
+    assert is_context_command("/context") is True
+    assert agent.context_stats_calls == [{"session": repl.session, "mode": "normal"}]
+    assert "* Context stats" in rendered
+    assert "- estimated tokens: 1200/128000" in rendered
+    assert "- last compaction: 1000 -> 600" in rendered
 
 
 def test_line_mode_reports_blocked_plan_mode_tool_result():
@@ -1015,6 +1259,144 @@ def test_tool_result_text_shows_failure_detail():
     assert tool_result_text(tool_call, False, 2.4, "Missing required arguments: pattern") == (
         "[bold red]x Glob: \\[bad] failed (2.4s): Missing required arguments: pattern[/bold red]"
     )
+
+
+def test_tool_result_spilled_text_shows_freed_chars():
+    event = ToolResultSpilled(
+        tool_call=ToolCall(name="ReadFile", arguments={"path": "large.txt"}),
+        count=1,
+        freed_chars=5598,
+        stored_path=".mewcode/context/session/tool-results/read.json",
+    )
+
+    assert tool_result_spilled_plain(event) == "spilled 1 tool result(s) to disk (~5598 chars freed)"
+    assert tool_result_spilled_text(event) == "[dim]* spilled 1 tool result(s) to disk (~5598 chars freed)[/dim]"
+
+
+def test_context_running_text_shows_spinner_and_elapsed():
+    event = ContextCompressionStarted(kind="auto", before_tokens=18016)
+
+    assert context_running_text(event, "|", 1.2) == (
+        "[bold blue]| Compacting context (auto, before 18016 tokens) (1.2s)[/bold blue]"
+    )
+
+
+def test_context_fallback_event_is_warning_not_compact_failure():
+    event = ContextCompressionFailed(
+        kind="auto",
+        message="LLM compact failed; using local fallback: Network or connection failed: timed out",
+        consecutive_failures=1,
+    )
+
+    assert context_event_plain(event) == (
+        "* LLM compact fallback (auto, failures: 1): Network or connection failed: timed out"
+    )
+    assert context_event_text(event) == (
+        "[bold yellow]* LLM compact fallback (auto, failures: 1): "
+        "Network or connection failed: timed out[/bold yellow]"
+    )
+
+
+def test_context_fallback_used_event_labels_quality():
+    event = ContextCompressionFallbackUsed(
+        kind="manual",
+        reason="Network timeout",
+        quality="llm_failed",
+        consecutive_failures=0,
+    )
+    local = ContextCompressionFallbackUsed(
+        kind="auto",
+        reason="breaker open",
+        quality="local",
+        consecutive_failures=3,
+    )
+
+    assert context_event_plain(event) == "* LLM compact fallback (manual): Network timeout"
+    event.consecutive_failures = 2
+    assert context_event_plain(event) == "* LLM compact fallback (manual): Network timeout"
+    assert context_event_plain(local) == "* Local fallback only (auto, failures: 3): breaker open"
+
+
+def test_context_chunk_events_are_observable():
+    started = ContextChunkSummaryStarted(kind="manual", chunk_index=1, chunk_count=3, input_tokens=900)
+    finished = ContextChunkSummaryFinished(kind="manual", chunk_index=1, chunk_count=3, output_tokens=120)
+
+    assert context_event_plain(started) == "* Summarizing context chunk 1/3 (900 tokens)"
+    assert context_event_plain(finished) == "* Context chunk 1/3 summarized (120 tokens)"
+
+
+def test_context_spinner_updates_without_active_main_status():
+    async def run_app() -> None:
+        app = MewCodeApp(provider=FakeProvider(), config=config(), version="0.1.0")
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.spinner_frames = ["|", "/"]
+            app.spinner_index = 0
+            app.is_generating = True
+            app._phase = None
+            app._status_widget = None
+            app._tool_widgets = {}
+            app._begin_context_status(ContextCompressionStarted(kind="auto", before_tokens=18016))
+
+            app._tick_spinner()
+
+            assert app._context_widget is not None
+            assert app._context_widget.message.content.startswith("[bold blue]/ Compacting context")
+
+    asyncio.run(run_app())
+
+
+def test_textual_context_fallback_line_stays_before_compacted_result():
+    async def run_app() -> None:
+        agent = FakeAgent(
+            stream_events=[
+                ContextCompressionStarted(kind="auto", before_tokens=17672),
+                ContextCompressionFailed(
+                    kind="auto",
+                    message="LLM compact failed; using local fallback: Network or connection failed",
+                    consecutive_failures=1,
+                ),
+                ContextCompressionFinished(kind="auto", before_tokens=17672, after_tokens=3900, reduced_tokens=13672),
+                TurnComplete(reason="final"),
+            ]
+        )
+        app = MewCodeApp(provider=FakeProvider(), config=config(), version="0.1.0", agent=agent)
+
+        async with app.run_test() as pilot:
+            prompt = app.query_one("#prompt-input", Input)
+            await pilot.pause()
+            prompt.value = "trigger compact"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            contents = [message.content for message in app.messages]
+            fallback_index = next(index for index, content in enumerate(contents) if "LLM compact fallback" in content)
+            compacted_index = next(index for index, content in enumerate(contents) if "Compacted:" in content)
+            assert fallback_index < compacted_index
+
+    asyncio.run(run_app())
+
+
+def test_context_compacted_plain_shows_estimated_tokens():
+    event = ContextCompressionFinished(kind="auto", before_tokens=4744, after_tokens=539, reduced_tokens=4205)
+
+    assert context_compacted_plain(event) == "Compacted: 4744 -> 539 estimated tokens (LLM compact succeeded)"
+    fallback = ContextCompressionFinished(
+        kind="manual",
+        before_tokens=4744,
+        after_tokens=539,
+        reduced_tokens=4205,
+        summary_quality="llm_failed",
+    )
+    assert context_compacted_plain(fallback) == "Compacted: 4744 -> 539 estimated tokens (LLM compact fallback)"
+
+
+def test_copy_command_target_parses_tui_copy_commands():
+    assert copy_command_target("/copy") == "transcript"
+    assert copy_command_target("/copy transcript") == "transcript"
+    assert copy_command_target("/copy last") == "last"
+    assert copy_command_target("/copy nope") is None
 
 
 def test_line_mode_skips_empty_input():

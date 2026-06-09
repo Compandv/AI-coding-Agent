@@ -31,6 +31,8 @@ dist/
 .idea/
 .claude/settings.local.json
 .mewcode/permissions.local.yaml
+.mewcode/context/
+.mewcode/sessions/
 .codex/
 
 # OS files

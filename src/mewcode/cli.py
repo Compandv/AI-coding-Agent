@@ -34,6 +34,7 @@ configure_windows_console_encoding()
 
 from mewcode.agent import SingleToolAgent
 from mewcode.config import ConfigError, load_config
+from mewcode.context import ContextManager
 from mewcode.mcp import MCPManager
 from mewcode.permissions import PermissionChecker, PermissionError
 from mewcode.providers import ProviderError, create_provider
@@ -53,8 +54,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     session = ChatSession()
-    context = ToolContext(root_dir=Path.cwd(), timeout_seconds=config.timeout_seconds)
+    max_output_chars = max(12000, config.context.single_result_byte_threshold + config.context.preview_chars)
+    context = ToolContext(
+        root_dir=Path.cwd(),
+        timeout_seconds=config.timeout_seconds,
+        max_output_chars=max_output_chars,
+    )
     registry = default_registry()
+    context_manager = ContextManager(root_dir=context.root_dir, provider=provider, config=config.context)
     mcp_manager = MCPManager(config.mcp, timeout_seconds=config.timeout_seconds, cwd=context.root_dir)
     mcp_manager.register_tools(registry)
     for server_name, error in mcp_manager.errors.items():
@@ -72,6 +79,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         context=context,
         max_tool_steps=config.max_tool_steps,
         permission_checker=permission_checker,
+        context_manager=context_manager,
     )
     repl = MewCodeRepl(
         provider=provider,

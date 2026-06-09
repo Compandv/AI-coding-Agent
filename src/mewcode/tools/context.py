@@ -21,7 +21,9 @@ class ToolContext:
             raise ToolError(f"Path is outside the allowed workspace: {raw_path}") from exc
         return resolved
 
-    def truncate_output(self, text: str) -> str:
+    def truncate_output(self, text: str | None) -> str:
+        if text is None:
+            return ""
         if len(text) <= self.max_output_chars:
             return text
         return text[: self.max_output_chars] + "\n...[truncated]"

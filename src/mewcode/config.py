@@ -8,6 +8,7 @@ from typing import Any
 
 import yaml
 
+from mewcode.context import ContextConfig
 from mewcode.permissions import DEFAULT_PERMISSION_MODE, PermissionError, PermissionMode, validate_permission_mode
 
 
@@ -51,6 +52,7 @@ class MewCodeConfig:
     max_tool_steps: int = 24
     permission_mode: PermissionMode = DEFAULT_PERMISSION_MODE
     mcp: MCPConfig = field(default_factory=MCPConfig)
+    context: ContextConfig = field(default_factory=ContextConfig)
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -85,6 +87,9 @@ def load_config(path: Path | None = None, project_path: Path | None = None) -> M
             "permission_mode",
             "mcp",
             "mcp_servers",
+            "context",
+            "context_management",
+            "context_window",
         }
     }
     timeout = raw.get("timeout_seconds", 60.0)
@@ -110,6 +115,7 @@ def load_config(path: Path | None = None, project_path: Path | None = None) -> M
     except PermissionError as exc:
         raise ConfigError(str(exc)) from exc
     mcp = normalize_mcp_config(raw.get("mcp"))
+    context = normalize_context_config(_merged_context_options(raw))
 
     return MewCodeConfig(
         protocol=str(raw["protocol"]),
@@ -121,6 +127,7 @@ def load_config(path: Path | None = None, project_path: Path | None = None) -> M
         max_tool_steps=max_tool_steps,
         permission_mode=permission_mode,
         mcp=mcp,
+        context=context,
         extra=extra,
     )
 
@@ -210,6 +217,69 @@ def normalize_mcp_config(raw: Any) -> MCPConfig:
             continue
         servers[server_name] = server
     return MCPConfig(servers=servers, skipped_servers=skipped)
+
+
+def normalize_context_config(raw: Any) -> ContextConfig:
+    if raw in (None, {}):
+        return ContextConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("Config field context must be a mapping when provided.")
+
+    defaults = ContextConfig()
+    aliases = {
+        "context_window": "context_window_tokens",
+        "auto_margin": "auto_margin_tokens",
+        "manual_margin": "manual_margin_tokens",
+        "recent_tokens": "recent_token_target",
+        "single_result_tokens": "single_result_token_threshold",
+        "aggregate_result_tokens": "aggregate_result_token_threshold",
+        "single_result_bytes": "single_result_byte_threshold",
+        "aggregate_result_bytes": "aggregate_result_byte_threshold",
+        "summary_failure_limit": "max_summary_failures",
+        "summary_chunk_target": "summary_chunk_target_tokens",
+        "summary_chunk_max": "summary_chunk_max_tokens",
+        "tool_preview_head": "tool_preview_head_chars",
+        "tool_preview_tail": "tool_preview_tail_chars",
+        "compact_focus_max": "compact_focus_max_chars",
+    }
+    values: dict[str, Any] = {}
+    valid_fields = set(defaults.__dataclass_fields__)  # type: ignore[attr-defined]
+    for key, value in raw.items():
+        normalized_key = aliases.get(str(key), str(key))
+        if normalized_key not in valid_fields:
+            values[normalized_key] = value
+            continue
+        if normalized_key == "cache_dir":
+            values[normalized_key] = str(value)
+            continue
+        values[normalized_key] = _positive_int(value, f"context.{normalized_key}")
+    try:
+        return ContextConfig(**values)
+    except TypeError as exc:
+        raise ConfigError(f"Invalid context configuration: {exc}") from exc
+
+
+def _merged_context_options(raw: dict[str, Any]) -> Any:
+    context_raw = raw.get("context") or raw.get("context_management")
+    if raw.get("context_window") is None:
+        return context_raw
+    if context_raw in (None, {}):
+        context_raw = {}
+    if not isinstance(context_raw, dict):
+        return context_raw
+    merged = dict(context_raw)
+    merged.setdefault("context_window_tokens", raw["context_window"])
+    return merged
+
+
+def _positive_int(value: Any, field_name: str) -> int:
+    try:
+        integer = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"Config field {field_name} must be a positive integer.") from exc
+    if integer < 1:
+        raise ConfigError(f"Config field {field_name} must be a positive integer.")
+    return integer
 
 
 def normalize_mcp_server(name: str, raw: dict[str, Any]) -> MCPServerConfig:

@@ -53,8 +53,14 @@ class ToolUsageSection(PromptSection):
             priority=30,
             content=(
                 "Prefer dedicated tools over shell commands for reading, searching, and editing workspace files. "
-                "Use Glob or Grep to locate files, ReadFile to inspect contents, EditFile for precise existing-file "
+                "Use Glob or Grep to locate files, ReadFile to inspect files, EditFile for precise existing-file "
                 "changes, WriteFile for new or full-file writes, and Bash only when command execution is necessary. "
+                "If a user explicitly lists two or more files to read, request multiple ReadFile tool calls in the "
+                "same model response so the Agent can execute them as one batch while still showing each file. Use "
+                "ReadFile start_line/end_line for snippets or line ranges instead of Bash, python -c, cat, or type. "
+                "After read tools, use metadata for file length, byte size, line count, returned range, and "
+                "truncation status. Do not run Bash only to count or slice files already read. When using Bash on "
+                "Windows, use Windows-compatible syntax; avoid POSIX heredocs (`<<EOF`) and Unix-only shell forms. "
                 "Observe tool results before deciding the next step."
             ),
         )

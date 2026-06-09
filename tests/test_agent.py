@@ -1,16 +1,24 @@
 from mewcode.agent import (
     DEFAULT_MAX_TOOL_STEPS,
     ConfirmationRequired,
+    ContextCompressionFinished,
+    ContextCompressionStarted,
+    ContextEmergencyRetry,
+    ContextStatsReported,
     PendingToolRequest,
     SingleToolAgent,
     ToolFinished,
+    ToolResultSpilled,
     UserQuestionRequested,
 )
+from mewcode.context import ContextConfig, ContextManager
 from mewcode.permissions import PermissionChecker
-from mewcode.providers.base import ChatResponse, ToolCall
+from mewcode.providers.base import ChatResponse, StreamChunk, ToolCall
+from mewcode.providers.errors import ProviderError
 from mewcode.session import ChatSession
+from mewcode.tools.base import Tool, ToolDefinition, ToolSchema
 from mewcode.tools.context import ToolContext
-from mewcode.tools.registry import default_registry
+from mewcode.tools.registry import ToolRegistry, default_registry
 from mewcode.mcp.client import MCPClient, MCPTool
 from mewcode.mcp.jsonrpc import make_success_response
 from mewcode.mcp.tools import MCPToolWrapper
@@ -31,6 +39,28 @@ class NoStreamProvider(FakeProvider):
         yield from ()
 
 
+class FailingStreamProvider(FakeProvider):
+    def __init__(self, responses):
+        super().__init__(responses)
+        self.stream_calls = []
+
+    def stream_response(self, messages, tools=None):
+        self.stream_calls.append({"messages": messages, "tools": tools})
+        raise ProviderError("Streaming response failed: peer closed connection without sending complete message body")
+        yield  # pragma: no cover
+
+
+class PartialThenFailingStreamProvider(FakeProvider):
+    def __init__(self):
+        super().__init__([ChatResponse(text="fallback should not run")])
+        self.stream_calls = []
+
+    def stream_response(self, messages, tools=None):
+        self.stream_calls.append({"messages": messages, "tools": tools})
+        yield StreamChunk(text="partial")
+        raise ProviderError("Streaming response failed: peer closed connection without sending complete message body")
+
+
 class ScriptedTransport:
     def __init__(self, responses):
         self.responses = list(responses)
@@ -44,6 +74,13 @@ class ScriptedTransport:
 
     def close(self):
         pass
+
+
+class ExplodingTool(Tool):
+    definition = ToolDefinition(name="Explode", description="Explode", schema=ToolSchema())
+
+    def execute(self, arguments, context):
+        raise TypeError("boom")
 
 
 def test_agent_returns_direct_answer_without_tool(tmp_path):
@@ -60,6 +97,50 @@ def test_agent_returns_direct_answer_without_tool(tmp_path):
         {"role": "user", "content": "hi"},
         {"role": "assistant", "content": "hello"},
     ]
+
+
+def test_agent_falls_back_to_non_streaming_when_stream_closes_before_content(tmp_path):
+    provider = FailingStreamProvider([ChatResponse(text="我是 MewCode。")])
+    agent = SingleToolAgent(provider=provider, registry=default_registry(), context=ToolContext(root_dir=tmp_path))
+    session = ChatSession()
+
+    result = agent.run_turn(session, "你是谁")
+
+    assert result.final_text == "我是 MewCode。"
+    assert result.stop_reason == "final"
+    assert len(provider.stream_calls) == 1
+    assert len(provider.calls) == 1
+
+
+def test_agent_does_not_fallback_after_partial_stream_content(tmp_path):
+    provider = PartialThenFailingStreamProvider()
+    agent = SingleToolAgent(provider=provider, registry=default_registry(), context=ToolContext(root_dir=tmp_path))
+    session = ChatSession()
+
+    events = list(agent.stream_turn(session, "hi"))
+
+    assert any(getattr(event, "text", "") == "partial" for event in events)
+    assert any(getattr(event, "message", "") == "Streaming response failed: peer closed connection without sending complete message body" for event in events)
+    assert provider.calls == []
+
+
+def test_agent_returns_tool_failure_when_tool_raises_unexpected_exception(tmp_path):
+    provider = NoStreamProvider(
+        [
+            ChatResponse(text="", tool_call=ToolCall(name="Explode", arguments={})),
+            ChatResponse(text="Recovered."),
+        ]
+    )
+    registry = ToolRegistry({"Explode": ExplodingTool()})
+    agent = SingleToolAgent(provider=provider, registry=registry, context=ToolContext(root_dir=tmp_path))
+    session = ChatSession()
+
+    result = agent.run_turn(session, "run exploding tool")
+
+    assert result.tool_result["ok"] is False
+    assert result.tool_result["metadata"]["unexpected_tool_error"] is True
+    assert "boom" in result.tool_result["error"]
+    assert result.final_text == "Recovered."
 
 
 def test_agent_loops_across_multiple_tool_steps_before_final_answer(tmp_path):
@@ -478,14 +559,9 @@ def test_agent_plan_mode_ask_user_question_parses_multiple_structured_questions(
 def test_agent_stops_at_max_tool_steps_without_executing_extra_tools(tmp_path):
     provider = NoStreamProvider(
         [
-            ChatResponse(
-                text="",
-                tool_calls=[
-                    ToolCall(name="WriteFile", arguments={"path": "one.txt", "content": "1"}),
-                    ToolCall(name="WriteFile", arguments={"path": "two.txt", "content": "2"}),
-                    ToolCall(name="WriteFile", arguments={"path": "three.txt", "content": "3"}),
-                ],
-            ),
+            ChatResponse(text="", tool_call=ToolCall(name="WriteFile", arguments={"path": "one.txt", "content": "1"})),
+            ChatResponse(text="", tool_call=ToolCall(name="WriteFile", arguments={"path": "two.txt", "content": "2"})),
+            ChatResponse(text="", tool_call=ToolCall(name="WriteFile", arguments={"path": "three.txt", "content": "3"})),
         ]
     )
     agent = SingleToolAgent(
@@ -519,6 +595,63 @@ def test_agent_reports_missing_tool_arguments_and_lets_model_continue(tmp_path):
     assert result.tool_result["ok"] is False
     assert "Missing required arguments: pattern" in result.tool_result["error"]
     assert result.final_text == "I need a pattern."
+
+
+def test_agent_counts_same_response_tool_calls_as_one_tool_step(tmp_path):
+    (tmp_path / "a.py").write_text("a1", encoding="utf-8")
+    (tmp_path / "b.py").write_text("b1", encoding="utf-8")
+    provider = NoStreamProvider(
+        [
+            ChatResponse(
+                text="",
+                tool_calls=[
+                    ToolCall(name="ReadFile", arguments={"path": "a.py"}),
+                    ToolCall(name="ReadFile", arguments={"path": "b.py"}),
+                ],
+            ),
+            ChatResponse(text="Read both files."),
+        ]
+    )
+    context = ToolContext(root_dir=tmp_path)
+    checker = PermissionChecker.from_workspace(context, mode="default", user_path=tmp_path / "missing-user.yaml")
+    agent = SingleToolAgent(
+        provider=provider,
+        registry=default_registry(),
+        context=context,
+        permission_checker=checker,
+        max_tool_steps=1,
+    )
+    session = ChatSession()
+
+    result = agent.run_turn(session, "read two files")
+
+    assert result.stop_reason == "final"
+    assert [tool_call.name for tool_call in result.tool_calls] == ["ReadFile", "ReadFile"]
+    assert [tool_call.arguments["path"] for tool_call in result.tool_calls] == ["a.py", "b.py"]
+    assert [tool_result["ok"] for tool_result in result.tool_results] == [True, True]
+    assert result.final_text == "Read both files."
+
+
+def test_agent_allows_final_answer_after_reaching_tool_step_limit(tmp_path):
+    (tmp_path / "a.py").write_text("a1", encoding="utf-8")
+    provider = NoStreamProvider(
+        [
+            ChatResponse(text="", tool_call=ToolCall(name="ReadFile", arguments={"path": "a.py"})),
+            ChatResponse(text="Final after one tool batch."),
+        ]
+    )
+    agent = SingleToolAgent(
+        provider=provider,
+        registry=default_registry(),
+        context=ToolContext(root_dir=tmp_path),
+        max_tool_steps=1,
+    )
+    session = ChatSession()
+
+    result = agent.run_turn(session, "read then summarize")
+
+    assert result.stop_reason == "final"
+    assert result.final_text == "Final after one tool batch."
 
 
 def test_agent_default_max_tool_steps_is_twenty_four():
@@ -624,3 +757,151 @@ def test_legacy_confirm_and_deny_methods_remain_callable(tmp_path):
     assert confirmed.tool_result["ok"] is True
     assert denied.tool_result["metadata"]["denied"] is True
 
+
+def test_agent_spills_large_tool_result_before_adding_to_history(tmp_path):
+    large_file = tmp_path / "large.txt"
+    large_file.write_text("x" * 51000, encoding="utf-8")
+    provider = NoStreamProvider(
+        [
+            ChatResponse(text="", tool_call=ToolCall(name="ReadFile", arguments={"path": "large.txt"})),
+            ChatResponse(text="Summarized."),
+        ]
+    )
+    context_manager = ContextManager(root_dir=tmp_path, provider=provider)
+    agent = SingleToolAgent(
+        provider=provider,
+        registry=default_registry(),
+        context=ToolContext(root_dir=tmp_path, max_output_chars=60000),
+        context_manager=context_manager,
+    )
+    session = ChatSession()
+
+    result = agent.run_turn(session, "read large")
+
+    assert result.tool_result["metadata"]["stored_on_disk"] is True
+    assert session.messages[2]["tool_result"]["metadata"]["stored_on_disk"] is True
+    assert (tmp_path / result.tool_result["metadata"]["stored_path"]).exists()
+    assert result.final_text == "Summarized."
+
+
+def test_agent_stream_emits_tool_result_spilled_event(tmp_path):
+    large_file = tmp_path / "large.txt"
+    large_file.write_text("x" * 51000, encoding="utf-8")
+    provider = NoStreamProvider(
+        [
+            ChatResponse(text="", tool_call=ToolCall(name="ReadFile", arguments={"path": "large.txt"})),
+            ChatResponse(text="Summarized."),
+        ]
+    )
+    context_manager = ContextManager(root_dir=tmp_path, provider=provider)
+    agent = SingleToolAgent(
+        provider=provider,
+        registry=default_registry(),
+        context=ToolContext(root_dir=tmp_path, max_output_chars=60000),
+        context_manager=context_manager,
+    )
+
+    events = list(agent.stream_turn(ChatSession(), "read large"))
+    spill_events = [event for event in events if isinstance(event, ToolResultSpilled)]
+
+    assert len(spill_events) == 1
+    assert spill_events[0].count == 1
+    assert spill_events[0].freed_chars > 0
+    assert spill_events[0].stored_path.endswith("ReadFile_0")
+    assert next(index for index, event in enumerate(events) if isinstance(event, ToolFinished)) < next(
+        index for index, event in enumerate(events) if isinstance(event, ToolResultSpilled)
+    )
+
+
+def test_agent_emergency_compacts_on_prompt_too_long_and_retries_once(tmp_path):
+    class PromptTooLongProvider(NoStreamProvider):
+        def __init__(self):
+            super().__init__([ChatResponse(text="<final_summary>Recovered context.</final_summary>"), ChatResponse(text="ok")])
+            self.failed_once = False
+
+        def complete_chat(self, messages, tools=None):
+            self.calls.append({"messages": messages, "tools": tools})
+            if not messages.metadata.get("context_compaction") and not self.failed_once:
+                self.failed_once = True
+                raise RuntimeError("prompt_too_long")
+            return self.responses.pop(0)
+
+    provider = PromptTooLongProvider()
+    manager = ContextManager(root_dir=tmp_path, provider=provider, config=ContextConfig(min_recent_messages=2))
+    agent = SingleToolAgent(
+        provider=provider,
+        registry=default_registry(),
+        context=ToolContext(root_dir=tmp_path),
+        context_manager=manager,
+    )
+    session = ChatSession()
+    for index in range(8):
+        session.add_user_message(f"old {index}")
+
+    events = list(agent.stream_turn(session, "continue"))
+
+    assert any(isinstance(event, ContextCompressionFinished) for event in events)
+    assert any(isinstance(event, ContextEmergencyRetry) for event in events)
+    assert session.messages[-1]["content"] == "ok"
+    assert provider.failed_once is True
+
+
+def test_agent_emits_auto_compact_started_before_summary_request(tmp_path):
+    provider = NoStreamProvider([ChatResponse(text="<final_summary>summary</final_summary>"), ChatResponse(text="done")])
+    manager = ContextManager(
+        root_dir=tmp_path,
+        provider=provider,
+        config=ContextConfig(context_window_tokens=50, auto_margin_tokens=10, min_recent_messages=2),
+    )
+    agent = SingleToolAgent(
+        provider=provider,
+        registry=default_registry(),
+        context=ToolContext(root_dir=tmp_path),
+        context_manager=manager,
+    )
+    session = ChatSession()
+    for index in range(8):
+        session.add_user_message("x" * 80)
+
+    stream = agent.stream_turn(session, "continue")
+    first_event = next(stream)
+
+    assert isinstance(first_event, ContextCompressionStarted)
+    assert provider.calls == []
+
+
+def test_agent_stream_compact_passes_focus_to_context_manager(tmp_path):
+    provider = NoStreamProvider([ChatResponse(text="<summary>focused</summary>")])
+    manager = ContextManager(root_dir=tmp_path, provider=provider, config=ContextConfig(min_recent_messages=2))
+    agent = SingleToolAgent(
+        provider=provider,
+        registry=default_registry(),
+        context=ToolContext(root_dir=tmp_path),
+        context_manager=manager,
+    )
+    session = ChatSession()
+    for index in range(8):
+        session.add_user_message(f"user {index}")
+
+    events = list(agent.stream_compact(session, focus="keep context.py details"))
+
+    assert any(isinstance(event, ContextCompressionFinished) for event in events)
+    assert "keep context.py details" in provider.calls[0]["messages"].messages[0]["content"]
+
+
+def test_agent_stream_context_stats_emits_report(tmp_path):
+    provider = NoStreamProvider([ChatResponse(text="unused")])
+    manager = ContextManager(root_dir=tmp_path, provider=provider)
+    agent = SingleToolAgent(
+        provider=provider,
+        registry=default_registry(),
+        context=ToolContext(root_dir=tmp_path),
+        context_manager=manager,
+    )
+    session = ChatSession()
+    session.add_user_message("hello")
+
+    events = list(agent.stream_context_stats(session))
+
+    assert any(isinstance(event, ContextStatsReported) for event in events)
+    assert events[-1].reason == "context"

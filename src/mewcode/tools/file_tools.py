@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from .base import Tool, ToolDefinition, ToolError, ToolParameter, ToolResult, ToolSchema
@@ -13,13 +12,29 @@ class ReadFileTool(Tool):
         description=(
             "Read the contents of a file in the current workspace. Use this after Glob or Grep identifies a candidate "
             "path, and before EditFile when you need to modify an existing file. Prefer ReadFile over Bash commands "
-            "like cat or type for inspecting workspace files. ReadFile accepts one explicit file path, not a glob or "
+            "like cat, type, or python -c scripts for inspecting workspace files. Use start_line and end_line when "
+            "you only need a code snippet or line range. ReadFile accepts one explicit file path, not a glob or "
             "wildcard pattern. For environment files, try explicit names one by one, such as .env, .env.local, "
-            ".env.example, .env.development, or .env.production."
+            ".env.example, .env.development, or .env.production. Use the returned metadata for file length, byte "
+            "size, line count, range, and truncation status instead of running Bash just to count or slice the file."
         ),
         schema=ToolSchema(
             properties={
                 "path": ToolParameter(type="string", description="Path to the file to read."),
+                "start_line": ToolParameter(
+                    type="integer",
+                    description=(
+                        "Optional 1-based first line to return. Use with end_line to inspect a specific snippet "
+                        "instead of reading the whole file."
+                    ),
+                ),
+                "end_line": ToolParameter(
+                    type="integer",
+                    description=(
+                        "Optional 1-based inclusive last line to return. If omitted with start_line, returns from "
+                        "start_line to the end of the file."
+                    ),
+                ),
             },
             required=["path"],
         ),
@@ -35,7 +50,41 @@ class ReadFileTool(Tool):
             content = path.read_text(encoding="utf-8")
         except OSError as exc:
             raise ToolError(f"Failed to read file: {exc}") from exc
-        return ToolResult(ok=True, content=context.truncate_output(content), metadata={"path": str(path)})
+        lines = content.splitlines()
+        selected_content = content
+        range_requested = "start_line" in arguments or "end_line" in arguments
+        requested_start_line: int | None = None
+        requested_end_line: int | None = None
+        if range_requested:
+            requested_start_line = _optional_positive_int(arguments, "start_line") or 1
+            requested_end_line = _optional_positive_int(arguments, "end_line") or len(lines)
+            if requested_end_line < requested_start_line:
+                raise ToolError("end_line must be greater than or equal to start_line.")
+            selected_content = "\n".join(lines[requested_start_line - 1 : requested_end_line])
+
+        truncated = len(selected_content) > context.max_output_chars
+        metadata: dict[str, Any] = {
+            "path": str(path),
+            "content_chars": len(content),
+            "content_bytes": len(content.encode("utf-8")),
+            "line_count": len(lines),
+            "truncated": truncated,
+        }
+        if range_requested:
+            metadata.update(
+                {
+                    "range_requested": True,
+                    "start_line": requested_start_line,
+                    "end_line": requested_end_line,
+                    "returned_line_count": len(selected_content.splitlines()),
+                    "returned_chars": len(selected_content),
+                }
+            )
+        return ToolResult(
+            ok=True,
+            content=context.truncate_output(selected_content),
+            metadata=metadata,
+        )
 
 
 class WriteFileTool(Tool):
@@ -110,3 +159,22 @@ class EditFileTool(Tool):
         except OSError as exc:
             raise ToolError(f"Failed to write file: {exc}") from exc
         return ToolResult(ok=True, content=f"Edited file: {path}", metadata={"path": str(path)})
+
+
+def _optional_positive_int(arguments: dict[str, Any], name: str) -> int | None:
+    if name not in arguments or arguments[name] is None:
+        return None
+    raw_value = arguments[name]
+    if isinstance(raw_value, str):
+        raw_value = raw_value.strip()
+        if not raw_value:
+            return None
+    if isinstance(raw_value, bool):
+        raise ToolError(f"{name} must be a positive integer.")
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ToolError(f"{name} must be a positive integer.") from exc
+    if value < 1:
+        raise ToolError(f"{name} must be a positive integer.")
+    return value

@@ -76,8 +76,10 @@ def test_cli_loads_config_and_runs_repl(monkeypatch, tmp_path):
     assert cli.main([]) == 0
     assert calls["config"] is config
     assert calls["permission"].mode == "default"
+    assert calls["permission"].context.max_output_chars == 52048
     assert calls["permission"].read_tool_names == {"fake__echo"}
     assert calls["repl"].agent.max_tool_steps == 32
+    assert calls["repl"].agent.context_manager.config is config.context
     assert calls["repl"].kwargs["mcp_status_provider"]() == {
         "configured_servers": 1,
         "connected_servers": 0,

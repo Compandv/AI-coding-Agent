@@ -25,3 +25,9 @@ def test_truncate_output_limits_size(tmp_path):
     context = ToolContext(root_dir=tmp_path, max_output_chars=5)
 
     assert context.truncate_output("abcdefgh") == "abcde\n...[truncated]"
+
+
+def test_truncate_output_treats_none_as_empty_text(tmp_path):
+    context = ToolContext(root_dir=tmp_path, max_output_chars=5)
+
+    assert context.truncate_output(None) == ""
