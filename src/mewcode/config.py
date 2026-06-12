@@ -9,6 +9,7 @@ from typing import Any
 import yaml
 
 from mewcode.context import ContextConfig
+from mewcode.memory import MemoryRuntimeConfig
 from mewcode.permissions import DEFAULT_PERMISSION_MODE, PermissionError, PermissionMode, validate_permission_mode
 
 
@@ -53,6 +54,7 @@ class MewCodeConfig:
     permission_mode: PermissionMode = DEFAULT_PERMISSION_MODE
     mcp: MCPConfig = field(default_factory=MCPConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
+    memory: MemoryRuntimeConfig = field(default_factory=MemoryRuntimeConfig)
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -90,6 +92,7 @@ def load_config(path: Path | None = None, project_path: Path | None = None) -> M
             "context",
             "context_management",
             "context_window",
+            "memory",
         }
     }
     timeout = raw.get("timeout_seconds", 60.0)
@@ -116,6 +119,7 @@ def load_config(path: Path | None = None, project_path: Path | None = None) -> M
         raise ConfigError(str(exc)) from exc
     mcp = normalize_mcp_config(raw.get("mcp"))
     context = normalize_context_config(_merged_context_options(raw))
+    memory = normalize_memory_config(raw.get("memory"))
 
     return MewCodeConfig(
         protocol=str(raw["protocol"]),
@@ -128,6 +132,7 @@ def load_config(path: Path | None = None, project_path: Path | None = None) -> M
         permission_mode=permission_mode,
         mcp=mcp,
         context=context,
+        memory=memory,
         extra=extra,
     )
 
@@ -259,6 +264,36 @@ def normalize_context_config(raw: Any) -> ContextConfig:
         raise ConfigError(f"Invalid context configuration: {exc}") from exc
 
 
+def normalize_memory_config(raw: Any) -> MemoryRuntimeConfig:
+    if raw in (None, {}):
+        return MemoryRuntimeConfig()
+    if not isinstance(raw, dict):
+        raise ConfigError("Config field memory must be a mapping when provided.")
+
+    defaults = MemoryRuntimeConfig()
+    values: dict[str, Any] = {}
+    aliases = {
+        "auto_memory": "auto_extract",
+        "retention_days": "session_retention_days",
+        "include_depth": "include_max_depth",
+        "memory_index_lines": "index_max_lines",
+        "memory_index_bytes": "index_max_bytes",
+    }
+    valid_fields = set(defaults.__dataclass_fields__)  # type: ignore[attr-defined]
+    for key, value in raw.items():
+        normalized_key = aliases.get(str(key), str(key))
+        if normalized_key not in valid_fields:
+            continue
+        if isinstance(getattr(defaults, normalized_key), bool):
+            values[normalized_key] = _bool_value(value, f"memory.{normalized_key}")
+        else:
+            values[normalized_key] = _positive_int(value, f"memory.{normalized_key}")
+    try:
+        return MemoryRuntimeConfig(**values)
+    except TypeError as exc:
+        raise ConfigError(f"Invalid memory configuration: {exc}") from exc
+
+
 def _merged_context_options(raw: dict[str, Any]) -> Any:
     context_raw = raw.get("context") or raw.get("context_management")
     if raw.get("context_window") is None:
@@ -280,6 +315,18 @@ def _positive_int(value: Any, field_name: str) -> int:
     if integer < 1:
         raise ConfigError(f"Config field {field_name} must be a positive integer.")
     return integer
+
+
+def _bool_value(value: Any, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "on", "1"}:
+            return True
+        if normalized in {"false", "no", "off", "0"}:
+            return False
+    raise ConfigError(f"Config field {field_name} must be a boolean.")
 
 
 def normalize_mcp_server(name: str, raw: dict[str, Any]) -> MCPServerConfig:

@@ -25,6 +25,8 @@ from mewcode.agent import (
     AgentStatus,
     ClarificationQuestion,
     ConfirmationRequired,
+    MemoryCommandResult,
+    MemoryUpdated,
     PendingToolRequest,
     QuestionOption,
     SingleToolAgent,
@@ -716,6 +718,16 @@ def is_context_command(text: str) -> bool:
     return text.strip().lower() == "/context"
 
 
+def is_memory_command(text: str) -> bool:
+    lowered = text.strip().lower()
+    return lowered == "/memory" or lowered.startswith("/memory ")
+
+
+def is_session_command(text: str) -> bool:
+    lowered = text.strip().lower()
+    return lowered == "/session" or lowered.startswith("/session ")
+
+
 def copy_command_target(text: str) -> str | None:
     lowered = text.strip().lower()
     if lowered in {"/copy", "/copy transcript"}:
@@ -1190,6 +1202,10 @@ class MewCodeApp(App[int]):
             await self._drive(self._agent_stream_context_stats, phase="Context")
             return
 
+        if is_memory_command(text) or is_session_command(text):
+            await self._drive(lambda: self._agent_stream_memory_command(text), phase="Context")
+            return
+
         command, remainder = parse_mode_command(text)
         if command is not None:
             self.mode = command
@@ -1247,6 +1263,14 @@ class MewCodeApp(App[int]):
             return stats(self.session, mode=self.mode)
         except TypeError:
             return stats(self.session)
+
+    def _agent_stream_memory_command(self, text: str) -> Iterator[AgentEvent]:
+        if self.agent is None:
+            return iter(())
+        command = getattr(self.agent, "stream_memory_command", None)
+        if command is None:
+            return iter(())
+        return command(self.session, text)
 
     async def _drive(self, make_stream: Callable[[], Iterator[AgentEvent]], phase: str) -> None:
         self.is_generating = True
@@ -1327,6 +1351,10 @@ class MewCodeApp(App[int]):
             text = context_event_text(event)
             if text:
                 self._mount_before_status(DisplayMessage("status", text))
+        elif isinstance(event, MemoryCommandResult):
+            self._mount_before_status(DisplayMessage("assistant", event.content))
+        elif isinstance(event, MemoryUpdated):
+            self._mount_before_status(DisplayMessage("status", f"[dim]* Memory updated ({event.count} item(s))[/dim]"))
         elif isinstance(event, ToolStarted):
             self._phase = "Coding"
             self._begin_tool_status(event.tool_call)
@@ -1886,6 +1914,11 @@ class MewCodeRepl:
                     self._handle_line_event(event)
                 continue
 
+            if is_memory_command(content) or is_session_command(content):
+                for event in self._agent_stream_memory_command(content):
+                    self._handle_line_event(event)
+                continue
+
             command, remainder = parse_mode_command(content)
             if command is not None:
                 self.mode = command
@@ -1928,6 +1961,14 @@ class MewCodeRepl:
         except TypeError:
             return stats(self.session)
 
+    def _agent_stream_memory_command(self, text: str) -> Iterator[AgentEvent]:
+        if self.agent is None:
+            return iter(())
+        command = getattr(self.agent, "stream_memory_command", None)
+        if command is None:
+            return iter(())
+        return command(self.session, text)
+
     def _handle_line_event(self, event: AgentEvent) -> None:
         if isinstance(event, TextDelta):
             self._println(event.text)
@@ -1961,6 +2002,10 @@ class MewCodeRepl:
                     self._println(f"* {mcp_line}")
         elif isinstance(event, ToolResultSpilled):
             self._println(f"* {tool_result_spilled_plain(event)}")
+        elif isinstance(event, MemoryCommandResult):
+            self._println(event.content)
+        elif isinstance(event, MemoryUpdated):
+            self._println(f"* Memory updated ({event.count} item(s))")
         elif isinstance(event, ConfirmationRequired):
             self.pending_request = event.pending_request
             self._println(confirmation_status_plain(event.pending_request.tool_call.name))

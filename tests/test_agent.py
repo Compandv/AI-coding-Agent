@@ -5,6 +5,8 @@ from mewcode.agent import (
     ContextCompressionStarted,
     ContextEmergencyRetry,
     ContextStatsReported,
+    MemoryCommandResult,
+    MemoryUpdated,
     PendingToolRequest,
     SingleToolAgent,
     ToolFinished,
@@ -12,6 +14,7 @@ from mewcode.agent import (
     UserQuestionRequested,
 )
 from mewcode.context import ContextConfig, ContextManager
+from mewcode.memory import MemoryContextManager, MemoryRuntimeConfig
 from mewcode.permissions import PermissionChecker
 from mewcode.providers.base import ChatResponse, StreamChunk, ToolCall
 from mewcode.providers.errors import ProviderError
@@ -905,3 +908,44 @@ def test_agent_stream_context_stats_emits_report(tmp_path):
 
     assert any(isinstance(event, ContextStatsReported) for event in events)
     assert events[-1].reason == "context"
+
+
+def test_agent_injects_memory_overlay_and_updates_memory_after_final(tmp_path):
+    (tmp_path / ".mewcode").mkdir()
+    (tmp_path / ".mewcode" / "MEWCODE.md").write_text("Always answer in Chinese.", encoding="utf-8")
+    provider = NoStreamProvider([ChatResponse(text="好的")])
+    memory_manager = MemoryContextManager(tmp_path, user_home=tmp_path / "home")
+    session = ChatSession()
+    memory_manager.attach_session(session)
+    agent = SingleToolAgent(
+        provider=provider,
+        registry=default_registry(),
+        context=ToolContext(root_dir=tmp_path),
+        memory_manager=memory_manager,
+    )
+
+    events = list(agent.stream_turn(session, "以后测试优先跑窄测试。"))
+
+    assert any(isinstance(event, MemoryUpdated) for event in events)
+    request_messages = provider.calls[0]["messages"].messages
+    assert any("Always answer in Chinese." in message["content"] for message in request_messages)
+    assert (tmp_path / "home" / ".mewcode" / "memory" / "index.md").exists()
+
+
+def test_agent_memory_command_streams_result(tmp_path):
+    provider = NoStreamProvider([ChatResponse(text="unused")])
+    memory_manager = MemoryContextManager(tmp_path, user_home=tmp_path / "home")
+    session = ChatSession()
+    memory_manager.attach_session(session)
+    agent = SingleToolAgent(
+        provider=provider,
+        registry=default_registry(),
+        context=ToolContext(root_dir=tmp_path),
+        memory_manager=memory_manager,
+    )
+
+    events = list(agent.stream_memory_command(session, "/session current"))
+
+    results = [event for event in events if isinstance(event, MemoryCommandResult)]
+    assert results[0].content == f"Current session: {session.session_id}"
+    assert events[-1].reason == "memory"

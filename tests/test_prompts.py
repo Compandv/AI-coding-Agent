@@ -89,6 +89,20 @@ def test_assemble_api_payload_distributes_seven_sources_to_three_channels(tmp_pa
     assert session_messages == [{"role": "user", "content": "hello"}]
 
 
+def test_assemble_api_payload_injects_memory_overlays_before_history(tmp_path):
+    payload = assemble_api_payload(
+        session_messages=[{"role": "user", "content": "hello"}],
+        tools=[],
+        root_dir=tmp_path,
+        overlay_messages=[system_reminder_message("Remember project preference.")],
+    )
+
+    assert "Environment context" in payload.messages[0]["content"]
+    assert "Remember project preference" in payload.messages[1]["content"]
+    assert payload.messages[2] == {"role": "user", "content": "hello"}
+    assert "Remember project preference" not in payload.system
+
+
 def test_plan_mode_reminder_uses_full_on_first_and_every_fifth_request():
     first = plan_mode_reminder(1)["content"]
     second = plan_mode_reminder(2)["content"]

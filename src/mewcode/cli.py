@@ -35,6 +35,7 @@ configure_windows_console_encoding()
 from mewcode.agent import SingleToolAgent
 from mewcode.config import ConfigError, load_config
 from mewcode.context import ContextManager
+from mewcode.memory import MemoryContextManager
 from mewcode.mcp import MCPManager
 from mewcode.permissions import PermissionChecker, PermissionError
 from mewcode.providers import ProviderError, create_provider
@@ -62,6 +63,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     registry = default_registry()
     context_manager = ContextManager(root_dir=context.root_dir, provider=provider, config=config.context)
+    memory_manager = MemoryContextManager(project_root=context.root_dir, config=config.memory)
+    memory_manager.attach_session(session)
+    memory_manager.sessions.cleanup_expired()
     mcp_manager = MCPManager(config.mcp, timeout_seconds=config.timeout_seconds, cwd=context.root_dir)
     mcp_manager.register_tools(registry)
     for server_name, error in mcp_manager.errors.items():
@@ -80,6 +84,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_tool_steps=config.max_tool_steps,
         permission_checker=permission_checker,
         context_manager=context_manager,
+        memory_manager=memory_manager,
     )
     repl = MewCodeRepl(
         provider=provider,

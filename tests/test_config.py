@@ -194,6 +194,8 @@ api_key: secret
     assert config.permission_mode == "default"
     assert config.context.context_window_tokens == 128000
     assert config.context.single_result_byte_threshold == 50000
+    assert config.memory.auto_extract is True
+    assert config.memory.session_retention_days == 30
 
 
 def test_load_config_parses_context_management_options(tmp_path):
@@ -270,6 +272,34 @@ context:
         load_config(path)
 
     assert "context.auto_margin_tokens" in str(exc_info.value)
+
+
+def test_load_config_parses_memory_options(tmp_path):
+    path = write_config(
+        tmp_path / "config.yaml",
+        """
+protocol: openai
+model: gpt-4.1
+base_url: https://api.openai.com/v1
+api_key: secret
+memory:
+  enabled: true
+  auto_memory: false
+  retention_days: 14
+  include_depth: 3
+  memory_index_lines: 120
+  memory_index_bytes: 12000
+""",
+    )
+
+    config = load_config(path)
+
+    assert config.memory.enabled is True
+    assert config.memory.auto_extract is False
+    assert config.memory.session_retention_days == 14
+    assert config.memory.include_max_depth == 3
+    assert config.memory.index_max_lines == 120
+    assert config.memory.index_max_bytes == 12000
 
 
 def test_load_config_reports_invalid_permission_mode(tmp_path):

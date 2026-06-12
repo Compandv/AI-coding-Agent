@@ -18,6 +18,7 @@ from mewcode.agent import (
     ContextCompressionFinished,
     ContextCompressionStarted,
     ContextStatsReported,
+    MemoryCommandResult,
     PendingToolRequest,
     QuestionOption,
     TextDelta,
@@ -90,6 +91,7 @@ class FakeAgent:
         self.deny_calls = []
         self.compact_calls = []
         self.context_stats_calls = []
+        self.memory_command_calls = []
 
     def _events_for(self, result):
         if self.stream_events is not None:
@@ -149,6 +151,11 @@ class FakeAgent:
             last_compaction_after_tokens=600,
         )
         yield TurnComplete(reason="context")
+
+    def stream_memory_command(self, session, text):
+        self.memory_command_calls.append({"session": session, "text": text})
+        yield MemoryCommandResult(f"handled {text}")
+        yield TurnComplete(reason="memory")
 
 
 class SequencedStreamAgent:
@@ -1116,6 +1123,20 @@ def test_line_mode_context_command_reports_context_stats():
     assert "* Context stats" in rendered
     assert "- estimated tokens: 1200/128000" in rendered
     assert "- last compaction: 1000 -> 600" in rendered
+
+
+def test_line_mode_session_and_memory_commands_stream_results():
+    agent = FakeAgent()
+    inputs = iter(["/session current", "/memory list", "/quit"])
+    output = StringIO()
+    repl = MewCodeRepl(provider=FakeProvider(), config=config(), input_func=lambda prompt: next(inputs), output=output, agent=agent)
+
+    assert repl.run() == 0
+
+    assert [call["text"] for call in agent.memory_command_calls] == ["/session current", "/memory list"]
+    rendered = output.getvalue()
+    assert "handled /session current" in rendered
+    assert "handled /memory list" in rendered
 
 
 def test_line_mode_reports_blocked_plan_mode_tool_result():

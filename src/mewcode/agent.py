@@ -17,6 +17,7 @@ from mewcode.context import (
     ContextManager,
     ContextStatsReported,
 )
+from mewcode.memory import MemoryContextManager
 from mewcode.permissions import ConfirmScope, PermissionChecker, PermissionDecision
 from mewcode.prompts import PromptPayload, assemble_api_payload
 from mewcode.providers.base import ChatProvider, ChatResponse, ProviderUsage, StreamChunk, ToolCall
@@ -102,6 +103,16 @@ class PromptUsageObserved:
 
 
 @dataclass
+class MemoryUpdated:
+    count: int = 0
+
+
+@dataclass
+class MemoryCommandResult:
+    content: str
+
+
+@dataclass
 class QuestionOption:
     label: str
     description: str = ""
@@ -168,6 +179,8 @@ AgentEvent = (
     | ContextStatsReported
     | ContextCompressionSkipped
     | ContextEmergencyRetry
+    | MemoryUpdated
+    | MemoryCommandResult
     | UserQuestionRequested
     | TurnCancelled
     | TurnComplete
@@ -209,6 +222,7 @@ class SingleToolAgent:
         max_tool_steps: int = DEFAULT_MAX_TOOL_STEPS,
         permission_checker: PermissionChecker | None = None,
         context_manager: ContextManager | None = None,
+        memory_manager: MemoryContextManager | None = None,
     ) -> None:
         self.provider = provider
         self.registry = registry
@@ -216,6 +230,7 @@ class SingleToolAgent:
         self.max_tool_steps = max_tool_steps
         self.permission_checker = permission_checker
         self.context_manager = context_manager
+        self.memory_manager = memory_manager
         self._cancel_requested = False
 
     def cancel(self) -> None:
@@ -389,6 +404,9 @@ class SingleToolAgent:
                 if not step.text:
                     yield TextDelta(final_text)
                 session.add_assistant_message(final_text)
+                memory_count = self._remember_completed_turn(session)
+                if memory_count:
+                    yield MemoryUpdated(memory_count)
                 yield TurnComplete("final")
                 return
 
@@ -489,6 +507,15 @@ class SingleToolAgent:
             model_request_index=0,
         )
         yield TurnComplete("context")
+
+    def stream_memory_command(self, session: ChatSession, text: str) -> Iterator[AgentEvent]:
+        if self.memory_manager is None:
+            yield MemoryCommandResult("Memory system is not configured.")
+            yield TurnComplete("memory")
+            return
+        result = self.memory_manager.command(text, session) or "Unknown memory/session command."
+        yield MemoryCommandResult(result)
+        yield TurnComplete("memory")
 
     def _collect_model_step(self, session: ChatSession, prompt_payload: PromptPayload) -> Iterator[AgentEvent | ModelStep]:
         text_parts: list[str] = []
@@ -882,13 +909,26 @@ class SingleToolAgent:
         mode: AgentMode,
         model_request_index: int,
     ) -> PromptPayload:
-        return assemble_api_payload(
+        overlay_messages = self.memory_manager.overlay_messages() if self.memory_manager is not None else []
+        payload = assemble_api_payload(
             session_messages=session.snapshot(),
             tools=tool_definitions,
             root_dir=self.context.root_dir,
             mode=mode,
             model_request_index=model_request_index,
+            overlay_messages=overlay_messages,
         )
+        if self.memory_manager is not None:
+            payload.metadata["memory_context"] = self.memory_manager.status_counts()
+        return payload
+
+    def _remember_completed_turn(self, session: ChatSession) -> int:
+        if self.memory_manager is None:
+            return 0
+        try:
+            return self.memory_manager.remember_turn(session)
+        except Exception:
+            return 0
 
     def _allows_plan_file_write(self, user_text: str) -> bool:
         normalized = user_text.lower()

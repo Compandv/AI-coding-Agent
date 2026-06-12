@@ -52,6 +52,25 @@ class FakeMCPManager:
         self.closed = True
 
 
+class FakeMemoryManager:
+    instances = []
+
+    def __init__(self, project_root, config):
+        self.project_root = project_root
+        self.config = config
+        self.attached_sessions = []
+        self.cleaned = False
+        self.sessions = self
+        FakeMemoryManager.instances.append(self)
+
+    def attach_session(self, session):
+        self.attached_sessions.append(session)
+
+    def cleanup_expired(self):
+        self.cleaned = True
+        return []
+
+
 def test_cli_loads_config_and_runs_repl(monkeypatch, tmp_path):
     config = MewCodeConfig(
         protocol="openai",
@@ -65,6 +84,7 @@ def test_cli_loads_config_and_runs_repl(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "load_config", lambda: config)
     monkeypatch.setattr(cli, "create_provider", lambda loaded: calls.setdefault("config", loaded) or FakeProvider())
     monkeypatch.setattr(cli, "MCPManager", FakeMCPManager)
+    monkeypatch.setattr(cli, "MemoryContextManager", FakeMemoryManager)
     monkeypatch.setattr(
         cli.PermissionChecker,
         "from_workspace",
@@ -80,6 +100,9 @@ def test_cli_loads_config_and_runs_repl(monkeypatch, tmp_path):
     assert calls["permission"].read_tool_names == {"fake__echo"}
     assert calls["repl"].agent.max_tool_steps == 32
     assert calls["repl"].agent.context_manager.config is config.context
+    assert calls["repl"].agent.memory_manager is FakeMemoryManager.instances[-1]
+    assert FakeMemoryManager.instances[-1].attached_sessions == [calls["repl"].session]
+    assert FakeMemoryManager.instances[-1].cleaned is True
     assert calls["repl"].kwargs["mcp_status_provider"]() == {
         "configured_servers": 1,
         "connected_servers": 0,

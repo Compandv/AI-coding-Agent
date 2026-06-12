@@ -452,7 +452,7 @@ class ContextManager:
     ) -> ContextOperationResult:
         target_tokens = self._target_tokens_after_compact(kind)
         recovery_message = self._recovery_message(session, summary, tool_definitions, target_tokens)
-        session.messages = [recovery_message, *[message.copy() for message in recent_messages]]
+        session.replace_messages([recovery_message, *[message.copy() for message in recent_messages]], reason=f"{kind}_compact")
         self._sanitize_session_messages(session)
         state = self.state_for(session)
         state.anchored_input_tokens = None
@@ -891,7 +891,9 @@ class ContextManager:
                 return
 
     def _sanitize_session_messages(self, session: ChatSession) -> None:
-        session.messages = self._sanitize_tool_message_pairs(session.messages)
+        sanitized = self._sanitize_tool_message_pairs(session.messages)
+        if sanitized != session.messages:
+            session.replace_messages(sanitized, reason="sanitize_tool_pairs")
 
     def _sanitize_tool_message_pairs(self, messages: list[Message]) -> list[Message]:
         sanitized: list[Message] = []

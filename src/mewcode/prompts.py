@@ -196,8 +196,13 @@ def assemble_api_payload(
     sections: list[PromptSection] | None = None,
     cache_policy: CachePolicy | None = None,
     now: datetime | None = None,
+    overlay_messages: list[Message] | None = None,
 ) -> PromptPayload:
-    messages = [environment_context_message(root_dir, now=now), *[message.copy() for message in session_messages]]
+    messages = [
+        environment_context_message(root_dir, now=now),
+        *[message.copy() for message in overlay_messages or []],
+        *[message.copy() for message in session_messages],
+    ]
     metadata: dict[str, Any] = {"mode": mode, "model_request_index": model_request_index}
     if mode == "plan":
         reminder = plan_mode_reminder(model_request_index)
