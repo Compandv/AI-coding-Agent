@@ -341,10 +341,15 @@ def test_textual_app_header_removes_learning_tag_and_exposes_mode_hint():
 
     assert app.title_line == "MewCode Agent v0.1.0"
     assert "gpt-4.1 with high effort" in app.model_line
+    assert "Mode: [DEFAULT]" in app.model_line
     assert "Permission: Default" in app.model_line
-    assert f"API Usage Billing {middle_dot()} Permission: Default {middle_dot()} MCP: 0/1 connected, 0 tools" in app.model_line
     assert (
-        f"API Usage Billing {middle_dot()} [#9ca3af]Permission: Default[/#9ca3af] "
+        f"API Usage Billing {middle_dot()} Mode: [DEFAULT] {middle_dot()} Permission: Default "
+        f"{middle_dot()} MCP: 0/1 connected, 0 tools"
+    ) in app.model_line
+    assert (
+        f"API Usage Billing {middle_dot()} [bold #a855f7]Mode: \\[DEFAULT][/bold #a855f7] "
+        f"{middle_dot()} [#9ca3af]Permission: Default[/#9ca3af] "
         f"{middle_dot()} [#22d3ee]MCP: 0/1 connected, 0 tools[/#22d3ee]"
     ) in app.header_markup
     assert "路" not in app.header_markup
@@ -418,10 +423,10 @@ def test_textual_input_accepts_slash_from_keyboard():
 
         async with app.run_test() as pilot:
             await pilot.pause()
-            await pilot.press("slash", "i", "n", "i", "t", "enter")
+            await pilot.press("slash", "r", "e", "v", "i", "e", "w", "enter")
             await pilot.pause()
 
-            assert agent.calls[0]["text"] == "/init"
+            assert "Review the current Git working tree changes" in agent.calls[0]["text"]
 
     asyncio.run(run_app())
 
@@ -1125,6 +1130,60 @@ def test_line_mode_context_command_reports_context_stats():
     assert "- last compaction: 1000 -> 600" in rendered
 
 
+def test_line_mode_local_slash_commands_do_not_call_agent():
+    agent = FakeAgent(result=AgentTurnResult(final_text="unused"))
+    inputs = iter(["/help", "/clear", "/status", "/foo", "/quit"])
+    output = StringIO()
+    repl = MewCodeRepl(provider=FakeProvider(), config=config(), input_func=lambda prompt: next(inputs), output=output, agent=agent)
+
+    assert repl.run() == 0
+
+    rendered = output.getvalue()
+    assert agent.calls == []
+    assert "Available commands:" in rendered
+    assert "/review" in rendered
+    assert "* Screen cleared" in rendered
+    assert "MewCode status" in rendered
+    assert "Unknown command: /foo. Type /help for available commands." in rendered
+
+
+def test_line_mode_review_command_sends_review_prompt_to_agent():
+    agent = FakeAgent(result=AgentTurnResult(final_text="reviewed"))
+    inputs = iter(["/review focus security", "/quit"])
+    output = StringIO()
+    repl = MewCodeRepl(provider=FakeProvider(), config=config(), input_func=lambda prompt: next(inputs), output=output, agent=agent)
+
+    assert repl.run() == 0
+
+    assert len(agent.calls) == 1
+    assert "Review the current Git working tree changes" in agent.calls[0]["text"]
+    assert "Review focus: focus security" in agent.calls[0]["text"]
+    assert "> /review focus security" in output.getvalue()
+
+
+def test_line_mode_permission_command_switches_mode_and_checker():
+    class Checker:
+        def __init__(self) -> None:
+            self.modes = []
+
+        def set_mode(self, mode):
+            self.modes.append(mode)
+
+    agent = FakeAgent(result=AgentTurnResult(final_text="unused"))
+    agent.permission_checker = Checker()
+    inputs = iter(["/permission acceptEdits", "/permission", "/quit"])
+    output = StringIO()
+    repl = MewCodeRepl(provider=FakeProvider(), config=config(), input_func=lambda prompt: next(inputs), output=output, agent=agent)
+
+    assert repl.run() == 0
+
+    assert repl.permission_mode == "acceptEdits"
+    assert agent.permission_checker.modes == ["acceptEdits"]
+    rendered = output.getvalue()
+    assert "* Permission mode: acceptEdits" in rendered
+    assert "Available modes: default, acceptEdits, plan, bypassPermissions" in rendered
+
+
 def test_line_mode_session_and_memory_commands_stream_results():
     agent = FakeAgent()
     inputs = iter(["/session current", "/memory list", "/quit"])
@@ -1137,6 +1196,42 @@ def test_line_mode_session_and_memory_commands_stream_results():
     rendered = output.getvalue()
     assert "handled /session current" in rendered
     assert "handled /memory list" in rendered
+
+
+def test_textual_tab_completes_single_slash_command():
+    async def run_app() -> None:
+        app = MewCodeApp(provider=FakeProvider(), config=config(), version="0.1.0")
+
+        async with app.run_test() as pilot:
+            prompt = app.query_one("#prompt-input", Input)
+            await pilot.pause()
+            prompt.value = "/perm"
+            prompt.cursor_position = len(prompt.value)
+            await pilot.press("tab")
+            await pilot.pause()
+
+            assert prompt.value == "/permission "
+
+    asyncio.run(run_app())
+
+
+def test_textual_clear_command_clears_display_without_calling_agent():
+    async def run_app() -> None:
+        agent = FakeAgent(result=AgentTurnResult(final_text="unused"))
+        app = MewCodeApp(provider=FakeProvider(), config=config(), version="0.1.0", agent=agent)
+
+        async with app.run_test() as pilot:
+            prompt = app.query_one("#prompt-input", Input)
+            await pilot.pause()
+            prompt.value = "/clear"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert agent.calls == []
+            assert len(app.messages) == 1
+            assert "Screen cleared" in app.messages[0].content
+
+    asyncio.run(run_app())
 
 
 def test_line_mode_reports_blocked_plan_mode_tool_result():

@@ -38,6 +38,7 @@ from mewcode.agent import (
     TurnComplete,
     UserQuestionRequested,
 )
+from mewcode.commands import CommandContext, CommandRegistry, CommandResult, make_builtin_registry
 from mewcode.config import MewCodeConfig
 from mewcode.context import (
     ContextChunkSummaryFinished,
@@ -235,10 +236,25 @@ class PromptInput(Input):
             self.app.action_cycle_permission_mode()
             event.stop()
             event.prevent_default()
+            return
+        if event.key == "tab":
+            complete = getattr(self.app, "action_complete_slash_command", None)
+            if complete is not None:
+                complete()
+                event.stop()
+                event.prevent_default()
 
 
 def model_status_line(config: MewCodeConfig) -> str:
     return f"{config.model} with high effort {middle_dot()} API Usage Billing"
+
+
+def agent_mode_label(mode: str) -> str:
+    return "[PLAN]" if mode == "plan" else "[DEFAULT]"
+
+
+def agent_mode_status_line(mode: str) -> str:
+    return f"Mode: {agent_mode_label(mode)}"
 
 
 def mcp_status_line(status: dict[str, int] | None) -> str:
@@ -448,6 +464,11 @@ def permission_mode_status_text(mode: str) -> str:
 
 def permission_mode_status_plain(mode: str) -> str:
     return f"* Permission mode: {mode}"
+
+
+def permission_options_plain(current: str) -> str:
+    options = ", ".join(PERMISSION_MODES)
+    return f"Permission mode: {current}\nAvailable modes: {options}"
 
 
 def next_permission_mode(mode: str) -> PermissionMode:
@@ -1011,6 +1032,7 @@ class MewCodeApp(App[int]):
         self.cwd = cwd or Path.cwd()
         self.version = version
         self.mcp_status_provider = mcp_status_provider
+        self.command_registry: CommandRegistry = make_builtin_registry()
         self.messages: list[DisplayMessage] = []
         self.status_started_at: float | None = None
         self.spinner_index = 0
@@ -1045,7 +1067,7 @@ class MewCodeApp(App[int]):
 
     @property
     def model_line(self) -> str:
-        parts = [model_status_line(self.config), permission_status_line(self.permission_mode)]
+        parts = [model_status_line(self.config), agent_mode_status_line(self.mode), permission_status_line(self.permission_mode)]
         mcp_line = self.mcp_status_line
         if mcp_line:
             parts.append(mcp_line)
@@ -1053,7 +1075,11 @@ class MewCodeApp(App[int]):
 
     @property
     def model_line_markup(self) -> str:
-        parts = [escaped_text(model_status_line(self.config)), permission_status_markup(self.permission_mode)]
+        parts = [
+            escaped_text(model_status_line(self.config)),
+            f"[bold #a855f7]{escaped_text(agent_mode_status_line(self.mode))}[/bold #a855f7]",
+            permission_status_markup(self.permission_mode),
+        ]
         mcp_line = self.mcp_status_line
         if mcp_line:
             parts.append(f"[#22d3ee]{escaped_text(mcp_line)}[/#22d3ee]")
@@ -1092,13 +1118,28 @@ class MewCodeApp(App[int]):
         self._restore_sigint_copy_handler()
 
     def action_cycle_permission_mode(self) -> None:
-        self.permission_mode = next_permission_mode(self.permission_mode)
+        self._set_permission_mode(next_permission_mode(self.permission_mode))
+        self._append_status_notice(permission_mode_status_text(self.permission_mode))
+        self.call_after_refresh(self._focus_input)
+
+    def action_complete_slash_command(self) -> None:
+        prompt = self.query_one("#prompt-input", PromptInput)
+        candidates = self.command_registry.complete(prompt.value)
+        if len(candidates) == 1:
+            prompt.value = candidates[0]
+            prompt.cursor_position = len(prompt.value)
+            self.call_after_refresh(self._focus_input)
+            return
+        if candidates:
+            self._append_status_notice(f"[dim]* Command matches: {escaped_text(', '.join(candidates))}[/dim]")
+            self.call_after_refresh(self._focus_input)
+
+    def _set_permission_mode(self, mode: PermissionMode) -> None:
+        self.permission_mode = mode
         checker = getattr(self.agent, "permission_checker", None)
         if checker is not None:
             checker.set_mode(self.permission_mode)
         self._apply_permission_theme()
-        self._append_status_notice(permission_mode_status_text(self.permission_mode))
-        self.call_after_refresh(self._focus_input)
 
     def _apply_permission_theme(self) -> None:
         self._refresh_header()
@@ -1170,50 +1211,17 @@ class MewCodeApp(App[int]):
         self.run_worker(self._handle_turn(text), exclusive=True, group="turn")
 
     async def _handle_turn(self, text: str) -> None:
+        command_result = self._dispatch_slash_command(text)
+        if command_result is not None:
+            await self._handle_command_result(command_result, text)
+            return
+
         if self.agent is None:
             self._append_message(DisplayMessage("user", text, active=True))
             self._append_message(DisplayMessage("assistant", "No agent configured."))
             self._begin_status(error_status_text("No agent configured"), phase=None)
             self.call_after_refresh(self._focus_input)
             return
-
-        copy_target = copy_command_target(text)
-        if copy_target == "transcript":
-            self.action_copy_transcript()
-            self.call_after_refresh(self._focus_input)
-            return
-        if copy_target == "last":
-            self.action_copy_last_answer()
-            self.call_after_refresh(self._focus_input)
-            return
-
-        if is_accept_command(text):
-            self.mode = "normal"
-            self._append_status_notice(accept_plan_status_text(self.last_plan_path))
-            self.call_after_refresh(self._focus_input)
-            return
-
-        compact_focus = compact_command_focus(text)
-        if compact_focus is not None:
-            await self._drive(lambda: self._agent_stream_compact(compact_focus), phase="Compacting")
-            return
-
-        if is_context_command(text):
-            await self._drive(self._agent_stream_context_stats, phase="Context")
-            return
-
-        if is_memory_command(text) or is_session_command(text):
-            await self._drive(lambda: self._agent_stream_memory_command(text), phase="Context")
-            return
-
-        command, remainder = parse_mode_command(text)
-        if command is not None:
-            self.mode = command
-            self._append_status_notice(mode_status_text(self.mode))
-            if not remainder:
-                self.call_after_refresh(self._focus_input)
-                return
-            text = remainder
 
         lowered = text.strip().lower()
         if self.pending_request is not None:
@@ -1233,6 +1241,125 @@ class MewCodeApp(App[int]):
         self._append_message(DisplayMessage("user", text, active=True))
         self._user_widget = self._last_widget()
         await self._drive(lambda: self._agent_stream_turn(text), phase="Thinking")
+
+    def _dispatch_slash_command(self, text: str) -> CommandResult | None:
+        return self.command_registry.dispatch(
+            text,
+            CommandContext(mode=self.mode, permission_mode=self.permission_mode, registry=self.command_registry),
+        )
+
+    async def _handle_command_result(self, result: CommandResult, original_text: str) -> None:
+        if result.action == "message":
+            self._append_message(DisplayMessage("assistant", result.message))
+            self.call_after_refresh(self._focus_input)
+            return
+        if result.action == "clear":
+            self._clear_display()
+            self._append_status_notice("[dim]* Screen cleared[/dim]")
+            self.call_after_refresh(self._focus_input)
+            return
+        if result.action == "copy":
+            if result.copy_target == "last":
+                self.action_copy_last_answer()
+            else:
+                self.action_copy_transcript()
+            self.call_after_refresh(self._focus_input)
+            return
+        if result.action == "accept":
+            self.mode = "normal"
+            self._refresh_header()
+            self._append_status_notice(accept_plan_status_text(self.last_plan_path))
+            self.call_after_refresh(self._focus_input)
+            return
+        if result.action == "set_mode":
+            self.mode = result.mode or "normal"
+            self._refresh_header()
+            self._append_status_notice(mode_status_text(self.mode))
+            if result.remainder:
+                await self._send_agent_text(result.remainder)
+            else:
+                self.call_after_refresh(self._focus_input)
+            return
+        if result.action == "permission_status":
+            self._append_message(DisplayMessage("assistant", permission_options_plain(self.permission_mode)))
+            self.call_after_refresh(self._focus_input)
+            return
+        if result.action == "set_permission":
+            if result.permission_mode is not None:
+                self._set_permission_mode(result.permission_mode)
+            self._append_status_notice(permission_mode_status_text(self.permission_mode))
+            self.call_after_refresh(self._focus_input)
+            return
+        if result.action == "status":
+            self._append_message(DisplayMessage("assistant", self._runtime_status_text()))
+            self.call_after_refresh(self._focus_input)
+            return
+        if result.action == "compact":
+            await self._drive(lambda: self._agent_stream_compact(result.focus), phase="Compacting")
+            return
+        if result.action == "context":
+            await self._drive(self._agent_stream_context_stats, phase="Context")
+            return
+        if result.action == "memory":
+            await self._drive(lambda: self._agent_stream_memory_command(result.command_line), phase="Context")
+            return
+        if result.action == "agent_prompt":
+            await self._send_agent_text(result.prompt, display_text=original_text)
+            return
+
+    async def _send_agent_text(self, text: str, display_text: str | None = None) -> None:
+        if self.agent is None:
+            self._append_message(DisplayMessage("user", display_text or text, active=True))
+            self._append_message(DisplayMessage("assistant", "No agent configured."))
+            self._begin_status(error_status_text("No agent configured"), phase=None)
+            self.call_after_refresh(self._focus_input)
+            return
+        self._append_message(DisplayMessage("user", display_text or text, active=True))
+        self._user_widget = self._last_widget()
+        await self._drive(lambda: self._agent_stream_turn(text), phase="Thinking")
+
+    def _clear_display(self) -> None:
+        self.messages.clear()
+        self._status_widget = None
+        self._reply_widget = None
+        self._user_widget = None
+        self._tool_widgets.clear()
+        self._tool_calls.clear()
+        self._tool_started_at.clear()
+        self._context_widget = None
+        chat = self.query_one("#chat", VerticalScroll)
+        for widget in list(chat.query(ChatMessage)):
+            widget.remove()
+
+    def _runtime_status_text(self) -> str:
+        lines = [
+            "MewCode status",
+            f"- model: {model_status_line(self.config)}",
+            f"- cwd: {self.cwd}",
+            f"- agent mode: {agent_mode_label(self.mode)}",
+            f"- permission: {self.permission_mode}",
+        ]
+        mcp_line = self.mcp_status_line
+        if mcp_line:
+            lines.append(f"- mcp: {mcp_line}")
+        context_manager = getattr(self.agent, "context_manager", None)
+        if context_manager is not None:
+            tokens = context_manager.estimate_session_tokens(self.session)
+            window = context_manager.config.context_window_tokens
+            lines.append(f"- context: {tokens}/{window} estimated session tokens")
+        else:
+            lines.append("- context: not configured")
+        memory_manager = getattr(self.agent, "memory_manager", None)
+        if memory_manager is not None:
+            counts = memory_manager.status_counts()
+            lines.append(
+                "- memory: "
+                f"{counts.get('memories', 0)} memories, {counts.get('sessions', 0)} sessions, "
+                f"auto={'on' if counts.get('auto_memory_enabled') else 'off'}"
+            )
+        else:
+            lines.append("- memory: not configured")
+        return "\n".join(lines)
 
     def _agent_stream_turn(self, text: str) -> Iterator[AgentEvent]:
         if self.agent is None:
@@ -1815,6 +1942,7 @@ class MewCodeRepl:
         self.cwd = cwd or Path.cwd()
         self.version = version
         self.mcp_status_provider = mcp_status_provider
+        self.command_registry: CommandRegistry = make_builtin_registry()
         self.pending_request: PendingToolRequest | None = None
         self.mode = "normal"
         self.permission_mode = config.permission_mode
@@ -1844,6 +1972,7 @@ class MewCodeRepl:
         parts = [
             f"MewCode Agent v{self.version}",
             model_status_line(self.config),
+            agent_mode_status_line(self.mode),
             permission_status_line(self.permission_mode),
         ]
         mcp_line = self._mcp_status_line()
@@ -1872,13 +2001,13 @@ class MewCodeRepl:
             if content in {"/exit", "/quit"}:
                 self._println("Bye.")
                 return 0
-            if self.agent is None:
-                self._println("* Error: No agent configured")
+            command_result = self._dispatch_slash_command(content)
+            if command_result is not None:
+                self._handle_line_command_result(command_result, content)
                 continue
 
-            copy_target = copy_command_target(content)
-            if copy_target is not None:
-                self._println("* Copy commands are available in TUI. Use terminal selection in line mode.")
+            if self.agent is None:
+                self._println("* Error: No agent configured")
                 continue
 
             if self.pending_request is not None:
@@ -1900,36 +2029,114 @@ class MewCodeRepl:
                     self._handle_line_event(event)
                 continue
 
-            if is_accept_command(content):
-                self.mode = "normal"
-                self._println(accept_plan_status_plain(self.last_plan_path))
-                continue
-            compact_focus = compact_command_focus(content)
-            if compact_focus is not None:
-                for event in self._agent_stream_compact(compact_focus):
-                    self._handle_line_event(event)
-                continue
-            if is_context_command(content):
-                for event in self._agent_stream_context_stats():
-                    self._handle_line_event(event)
-                continue
-
-            if is_memory_command(content) or is_session_command(content):
-                for event in self._agent_stream_memory_command(content):
-                    self._handle_line_event(event)
-                continue
-
-            command, remainder = parse_mode_command(content)
-            if command is not None:
-                self.mode = command
-                self._println(mode_status_plain(self.mode))
-                if not remainder:
-                    continue
-                content = remainder
-
             self._println(f"> {content}")
             for event in self._agent_stream_turn(content):
                 self._handle_line_event(event)
+
+    def _dispatch_slash_command(self, text: str) -> CommandResult | None:
+        return self.command_registry.dispatch(
+            text,
+            CommandContext(mode=self.mode, permission_mode=self.permission_mode, registry=self.command_registry),
+        )
+
+    def _handle_line_command_result(self, result: CommandResult, original_text: str) -> None:
+        if result.action == "message":
+            self._println(result.message)
+            return
+        if result.action == "clear":
+            self._println("\033[2J\033[H* Screen cleared")
+            return
+        if result.action == "copy":
+            self._println("* Copy commands are available in TUI. Use terminal selection in line mode.")
+            return
+        if result.action == "accept":
+            self.mode = "normal"
+            self._println(accept_plan_status_plain(self.last_plan_path))
+            return
+        if result.action == "set_mode":
+            self.mode = result.mode or "normal"
+            self._println(mode_status_plain(self.mode))
+            if result.remainder:
+                self._send_line_agent_text(result.remainder)
+            return
+        if result.action == "permission_status":
+            self._println(permission_options_plain(self.permission_mode))
+            return
+        if result.action == "set_permission":
+            if result.permission_mode is not None:
+                self._set_line_permission_mode(result.permission_mode)
+            self._println(permission_mode_status_plain(self.permission_mode))
+            return
+        if result.action == "status":
+            self._println(self._line_runtime_status_text())
+            return
+        if result.action == "compact":
+            if self.agent is None:
+                self._println("* Error: No agent configured")
+                return
+            for event in self._agent_stream_compact(result.focus):
+                self._handle_line_event(event)
+            return
+        if result.action == "context":
+            if self.agent is None:
+                self._println("* Error: No agent configured")
+                return
+            for event in self._agent_stream_context_stats():
+                self._handle_line_event(event)
+            return
+        if result.action == "memory":
+            if self.agent is None:
+                self._println("* Error: No agent configured")
+                return
+            for event in self._agent_stream_memory_command(result.command_line):
+                self._handle_line_event(event)
+            return
+        if result.action == "agent_prompt":
+            self._send_line_agent_text(result.prompt, display_text=original_text)
+
+    def _send_line_agent_text(self, text: str, display_text: str | None = None) -> None:
+        if self.agent is None:
+            self._println("* Error: No agent configured")
+            return
+        self._println(f"> {display_text or text}")
+        for event in self._agent_stream_turn(text):
+            self._handle_line_event(event)
+
+    def _set_line_permission_mode(self, mode: PermissionMode) -> None:
+        self.permission_mode = mode
+        checker = getattr(self.agent, "permission_checker", None)
+        if checker is not None:
+            checker.set_mode(self.permission_mode)
+
+    def _line_runtime_status_text(self) -> str:
+        lines = [
+            "MewCode status",
+            f"- model: {model_status_line(self.config)}",
+            f"- cwd: {self.cwd}",
+            f"- agent mode: {agent_mode_label(self.mode)}",
+            f"- permission: {self.permission_mode}",
+        ]
+        mcp_line = self._mcp_status_line()
+        if mcp_line:
+            lines.append(f"- mcp: {mcp_line}")
+        context_manager = getattr(self.agent, "context_manager", None)
+        if context_manager is not None:
+            tokens = context_manager.estimate_session_tokens(self.session)
+            window = context_manager.config.context_window_tokens
+            lines.append(f"- context: {tokens}/{window} estimated session tokens")
+        else:
+            lines.append("- context: not configured")
+        memory_manager = getattr(self.agent, "memory_manager", None)
+        if memory_manager is not None:
+            counts = memory_manager.status_counts()
+            lines.append(
+                "- memory: "
+                f"{counts.get('memories', 0)} memories, {counts.get('sessions', 0)} sessions, "
+                f"auto={'on' if counts.get('auto_memory_enabled') else 'off'}"
+            )
+        else:
+            lines.append("- memory: not configured")
+        return "\n".join(lines)
 
     def _agent_stream_turn(self, content: str) -> Iterator[AgentEvent]:
         if self.agent is None:
