@@ -8,6 +8,8 @@ from mewcode.commands import (
     make_builtin_registry,
     parse_command_line,
 )
+from mewcode.skills import SkillManager
+from mewcode.tools import default_registry
 
 
 def noop(context, invocation):
@@ -72,3 +74,19 @@ def test_builtin_commands_return_expected_actions():
     assert registry.dispatch("/permission nope").action == "message"
     assert registry.dispatch("/status").action == "status"
     assert "Git working tree" in registry.dispatch("/review").prompt
+
+
+def test_skill_commands_are_registered_when_skill_manager_is_available(tmp_path):
+    manager = SkillManager(tmp_path / "project", default_registry(), user_home=tmp_path / "home")
+    manager.load()
+    registry = make_builtin_registry(manager)
+
+    help_text = registry.dispatch("/help", CommandContext(registry=registry)).message
+    result = registry.dispatch("/review focus auth", CommandContext(registry=registry))
+
+    assert "/commit" in help_text
+    assert "/commit " in registry.complete("/com")
+    assert result.action == "skill_prompt"
+    assert result.skill_name == "review"
+    assert result.arguments == "focus auth"
+    assert registry.dispatch("/skill list").action == "skill"

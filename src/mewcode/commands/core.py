@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Literal, Protocol
+from typing import Any, Callable, Literal, Protocol
 
 from mewcode.permissions import PERMISSION_MODES, PermissionMode, validate_permission_mode
 
@@ -18,6 +18,8 @@ CommandAction = Literal[
     "set_permission",
     "status",
     "agent_prompt",
+    "skill",
+    "skill_prompt",
     "copy",
     "accept",
 ]
@@ -53,6 +55,7 @@ class CommandContext:
     mode: str = "normal"
     permission_mode: PermissionMode = "default"
     registry: "CommandRegistry | None" = None
+    skill_manager: Any = None
 
 
 @dataclass(frozen=True)
@@ -66,6 +69,8 @@ class CommandResult:
     permission_mode: PermissionMode | None = None
     copy_target: str = ""
     prompt: str = ""
+    skill_name: str = ""
+    arguments: str = ""
 
 
 CommandHandler = Callable[[CommandContext, CommandInvocation], CommandResult]
@@ -170,19 +175,22 @@ class CommandRegistry:
                 mode=active_context.mode,
                 permission_mode=active_context.permission_mode,
                 registry=self,
+                skill_manager=active_context.skill_manager,
             )
         return definition.handler(active_context, invocation)
 
 
-def make_builtin_registry() -> CommandRegistry:
+def make_builtin_registry(skill_manager: Any = None) -> CommandRegistry:
     registry = CommandRegistry()
-    for definition in builtin_definitions():
+    for definition in builtin_definitions(skill_manager):
         registry.register(definition)
+    if skill_manager is not None:
+        register_skill_commands(registry, skill_manager)
     return registry
 
 
-def builtin_definitions() -> list[CommandDefinition]:
-    return [
+def builtin_definitions(skill_manager: Any = None) -> list[CommandDefinition]:
+    definitions = [
         CommandDefinition("help", "Show available slash commands.", "/help", "local", _help, aliases=("?",)),
         CommandDefinition("compact", "Compact the current conversation context.", "/compact [focus <text>]", "local", _compact),
         CommandDefinition("clear", "Clear the current screen without changing conversation state.", "/clear", "ui", _clear, aliases=("cls",)),
@@ -190,13 +198,32 @@ def builtin_definitions() -> list[CommandDefinition]:
         CommandDefinition("do", "Switch back to normal execution mode, optionally sending the rest as a task.", "/do [task]", "ui", _do),
         CommandDefinition("session", "Manage saved sessions.", "/session <list|current|resume|delete|rename>", "local", _memory_command),
         CommandDefinition("memory", "Manage cross-session memory.", "/memory <list|refresh|on|off|delete>", "local", _memory_command),
+        CommandDefinition("skill", "Manage reusable Skill packages.", "/skill <list|info <name>|reload>", "local", _skill_command),
         CommandDefinition("permission", "Show or switch permission mode.", "/permission [default|acceptEdits|plan|bypassPermissions]", "ui", _permission, aliases=("perm",)),
         CommandDefinition("status", "Show local runtime status.", "/status", "local", _status),
-        CommandDefinition("review", "Review the current Git working tree changes.", "/review [focus]", "prompt", _review),
         CommandDefinition("context", "Show context token stats.", "/context", "local", _context, hidden=True),
         CommandDefinition("accept", "Accept the current plan.", "/accept", "ui", _accept, hidden=True),
         CommandDefinition("copy", "Copy transcript or last answer in TUI.", "/copy [last|transcript]", "ui", _copy, hidden=True),
     ]
+    if skill_manager is None or getattr(skill_manager, "get", lambda name: None)("review") is None:
+        definitions.insert(
+            9,
+            CommandDefinition("review", "Review the current Git working tree changes.", "/review [focus]", "prompt", _review),
+        )
+    return definitions
+
+
+def register_skill_commands(registry: CommandRegistry, skill_manager: Any) -> None:
+    for skill in skill_manager.list_skills():
+        registry.register(
+            CommandDefinition(
+                skill.name,
+                skill.description,
+                f"/{skill.name} [arguments]",
+                "prompt",
+                _skill_prompt(skill.name),
+            )
+        )
 
 
 def _help(context: CommandContext, invocation: CommandInvocation) -> CommandResult:
@@ -227,6 +254,17 @@ def _do(context: CommandContext, invocation: CommandInvocation) -> CommandResult
 
 def _memory_command(context: CommandContext, invocation: CommandInvocation) -> CommandResult:
     return CommandResult("memory", command_line=invocation.raw)
+
+
+def _skill_command(context: CommandContext, invocation: CommandInvocation) -> CommandResult:
+    return CommandResult("skill", command_line=invocation.raw)
+
+
+def _skill_prompt(skill_name: str) -> CommandHandler:
+    def handler(context: CommandContext, invocation: CommandInvocation) -> CommandResult:
+        return CommandResult("skill_prompt", skill_name=skill_name, arguments=invocation.args)
+
+    return handler
 
 
 def _permission(context: CommandContext, invocation: CommandInvocation) -> CommandResult:

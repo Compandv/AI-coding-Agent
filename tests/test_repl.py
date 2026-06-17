@@ -30,6 +30,8 @@ from mewcode.agent import (
 )
 from mewcode.config import MewCodeConfig
 from mewcode.providers.base import ToolCall
+from mewcode.skills import SkillManager
+from mewcode.tools import default_registry
 from mewcode.repl import (
     ASCII_SPINNER_FRAMES,
     BRAILLE_SPINNER_FRAMES,
@@ -92,6 +94,7 @@ class FakeAgent:
         self.compact_calls = []
         self.context_stats_calls = []
         self.memory_command_calls = []
+        self.skill_command_calls = []
 
     def _events_for(self, result):
         if self.stream_events is not None:
@@ -156,6 +159,13 @@ class FakeAgent:
         self.memory_command_calls.append({"session": session, "text": text})
         yield MemoryCommandResult(f"handled {text}")
         yield TurnComplete(reason="memory")
+
+    def stream_skill_command(self, session, skill_name, arguments="", mode="normal"):
+        self.skill_command_calls.append(
+            {"session": session, "skill_name": skill_name, "arguments": arguments, "mode": mode}
+        )
+        yield TextDelta(text=f"skill {skill_name}: {arguments}")
+        yield TurnComplete(reason="skill")
 
 
 class SequencedStreamAgent:
@@ -1159,6 +1169,52 @@ def test_line_mode_review_command_sends_review_prompt_to_agent():
     assert "Review the current Git working tree changes" in agent.calls[0]["text"]
     assert "Review focus: focus security" in agent.calls[0]["text"]
     assert "> /review focus security" in output.getvalue()
+
+
+def test_line_mode_skill_commands_use_skill_dispatcher(tmp_path):
+    agent = FakeAgent()
+    manager = SkillManager(tmp_path / "project", default_registry(), user_home=tmp_path / "home")
+    manager.load()
+    inputs = iter(["/skill list", "/commit release notes", "/quit"])
+    output = StringIO()
+    repl = MewCodeRepl(
+        provider=FakeProvider(),
+        config=config(),
+        input_func=lambda prompt: next(inputs),
+        output=output,
+        agent=agent,
+        skill_manager=manager,
+    )
+
+    assert repl.run() == 0
+
+    rendered = output.getvalue()
+    assert "Available skills:" in rendered
+    assert agent.skill_command_calls == [
+        {"session": repl.session, "skill_name": "commit", "arguments": "release notes", "mode": "normal"}
+    ]
+    assert "skill commit: release notes" in rendered
+
+
+def test_line_mode_clear_clears_active_skills(tmp_path):
+    agent = FakeAgent()
+    manager = SkillManager(tmp_path / "project", default_registry(), user_home=tmp_path / "home")
+    manager.load()
+    manager.activate("commit")
+    inputs = iter(["/clear", "/quit"])
+    output = StringIO()
+    repl = MewCodeRepl(
+        provider=FakeProvider(),
+        config=config(),
+        input_func=lambda prompt: next(inputs),
+        output=output,
+        agent=agent,
+        skill_manager=manager,
+    )
+
+    assert repl.run() == 0
+
+    assert manager.active_skill_names == []
 
 
 def test_line_mode_permission_command_switches_mode_and_checker():

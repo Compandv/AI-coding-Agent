@@ -8,6 +8,7 @@ from mewcode.commands.core import (
     UIController,
     make_builtin_registry,
     parse_command_line,
+    register_skill_commands,
     review_prompt,
 )
 
@@ -21,5 +22,6 @@ __all__ = [
     "UIController",
     "make_builtin_registry",
     "parse_command_line",
+    "register_skill_commands",
     "review_prompt",
 ]

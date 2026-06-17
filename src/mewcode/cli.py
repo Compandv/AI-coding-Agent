@@ -41,6 +41,7 @@ from mewcode.permissions import PermissionChecker, PermissionError
 from mewcode.providers import ProviderError, create_provider
 from mewcode.repl import MewCodeRepl
 from mewcode.session import ChatSession
+from mewcode.skills import SkillManager
 from mewcode.tools import ToolContext, default_registry
 
 
@@ -68,8 +69,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     memory_manager.sessions.cleanup_expired()
     mcp_manager = MCPManager(config.mcp, timeout_seconds=config.timeout_seconds, cwd=context.root_dir)
     mcp_manager.register_tools(registry)
+    skill_manager = SkillManager(
+        project_root=context.root_dir,
+        registry=registry,
+        mcp_server_names=set(config.mcp.servers),
+    )
+    skill_manager.load()
+    skill_manager.register_tools()
     for server_name, error in mcp_manager.errors.items():
         print(f"Warning: MCP server {server_name} skipped: {error}", file=sys.stderr)
+    for issue in skill_manager.issues:
+        print(f"Warning: Skill {issue.path} skipped: {issue.message}", file=sys.stderr)
     try:
         permission_checker = PermissionChecker.from_workspace(context, mode=config.permission_mode)
     except PermissionError as exc:
@@ -85,6 +95,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         permission_checker=permission_checker,
         context_manager=context_manager,
         memory_manager=memory_manager,
+        skill_manager=skill_manager,
     )
     repl = MewCodeRepl(
         provider=provider,
@@ -92,6 +103,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         session=session,
         agent=agent,
         mcp_status_provider=mcp_manager.status_counts,
+        skill_manager=skill_manager,
     )
     try:
         return repl.run()

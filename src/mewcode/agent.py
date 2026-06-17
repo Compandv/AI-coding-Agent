@@ -23,6 +23,7 @@ from mewcode.prompts import PromptPayload, assemble_api_payload
 from mewcode.providers.base import ChatProvider, ChatResponse, ProviderUsage, StreamChunk, ToolCall
 from mewcode.providers.errors import ProviderError
 from mewcode.session import ChatSession
+from mewcode.skills import SkillManager
 from mewcode.tools import ToolContext, ToolError, ToolRegistry
 
 
@@ -223,6 +224,7 @@ class SingleToolAgent:
         permission_checker: PermissionChecker | None = None,
         context_manager: ContextManager | None = None,
         memory_manager: MemoryContextManager | None = None,
+        skill_manager: SkillManager | None = None,
     ) -> None:
         self.provider = provider
         self.registry = registry
@@ -231,6 +233,7 @@ class SingleToolAgent:
         self.permission_checker = permission_checker
         self.context_manager = context_manager
         self.memory_manager = memory_manager
+        self.skill_manager = skill_manager
         self._cancel_requested = False
 
     def cancel(self) -> None:
@@ -335,6 +338,8 @@ class SingleToolAgent:
         session: ChatSession,
         user_text: str,
         mode: AgentMode = "normal",
+        skill_names: list[str] | None = None,
+        skill_arguments: str = "",
     ) -> Iterator[AgentEvent]:
         self.reset_cancel()
         if user_text:
@@ -349,7 +354,7 @@ class SingleToolAgent:
 
             model_request_index += 1
             try:
-                tool_definitions = self.registry.list_definitions()
+                tool_definitions = self._tool_definitions_for_skills(skill_names)
                 if self.context_manager is not None:
                     start_event = self.context_manager.prepare_start_event(
                         session,
@@ -371,7 +376,14 @@ class SingleToolAgent:
                         yield TurnCancelled()
                         return
                 yield AgentStatus("Thinking")
-                prompt_payload = self._prompt_payload(session, tool_definitions, mode, model_request_index)
+                prompt_payload = self._prompt_payload(
+                    session,
+                    tool_definitions,
+                    mode,
+                    model_request_index,
+                    skill_names=skill_names,
+                    skill_arguments=skill_arguments,
+                )
                 try:
                     step = yield from self._collect_model_step(session, prompt_payload)
                 except Exception as exc:
@@ -389,7 +401,14 @@ class SingleToolAgent:
                     if not emergency_result.compacted:
                         raise
                     yield ContextEmergencyRetry(str(exc))
-                    prompt_payload = self._prompt_payload(session, tool_definitions, mode, model_request_index)
+                    prompt_payload = self._prompt_payload(
+                        session,
+                        tool_definitions,
+                        mode,
+                        model_request_index,
+                        skill_names=skill_names,
+                        skill_arguments=skill_arguments,
+                    )
                     step = yield from self._collect_model_step(session, prompt_payload)
             except Exception as exc:
                 yield AgentError(str(exc))
@@ -421,7 +440,12 @@ class SingleToolAgent:
             tool_calls = step.tool_calls
             session.add_tool_calls([tool_call_payload(tool_call, index) for index, tool_call in enumerate(tool_calls)])
 
-            confirmation = self._permission_confirmation(tool_calls, mode, allow_plan_file_write)
+            confirmation = self._permission_confirmation(
+                tool_calls,
+                mode,
+                allow_plan_file_write,
+                turn_skill_names=skill_names,
+            )
             if confirmation is not None:
                 yield confirmation
                 yield TurnComplete("await_user")
@@ -432,6 +456,7 @@ class SingleToolAgent:
                 tool_calls,
                 mode,
                 allow_plan_file_write=allow_plan_file_write,
+                turn_skill_names=skill_names,
             )
             for index, (tool_call, result) in enumerate(zip(tool_calls, results)):
                 self._sync_dynamic_tool_permissions(result)
@@ -444,6 +469,64 @@ class SingleToolAgent:
                 yield TurnComplete("await_user")
                 return
 
+
+    def stream_skill_command(
+        self,
+        session: ChatSession,
+        skill_name: str,
+        arguments: str = "",
+        mode: AgentMode = "normal",
+    ) -> Iterator[AgentEvent]:
+        if self.skill_manager is None:
+            yield AgentError("Skill system is not configured.")
+            yield TurnComplete("error")
+            return
+        skill = self.skill_manager.get(skill_name)
+        if skill is None:
+            yield AgentError(f"Unknown skill: {skill_name}")
+            yield TurnComplete("error")
+            return
+
+        prompt = skill.render(arguments)
+        if skill.mode == "inline":
+            yield from self.stream_turn(
+                session,
+                prompt,
+                mode=mode,
+                skill_names=[skill.name],
+                skill_arguments=arguments,
+            )
+            return
+
+        session.add_user_message(prompt)
+        fork_session = self._fork_session(session, skill.history)
+        final_text = ""
+        for event in self.stream_turn(
+            fork_session,
+            prompt,
+            mode=mode,
+            skill_names=[skill.name],
+            skill_arguments=arguments,
+        ):
+            if isinstance(event, TextDelta):
+                final_text += event.text
+            yield event
+        if not final_text:
+            for message in reversed(fork_session.messages):
+                if message.get("role") == "assistant" and "content" in message:
+                    final_text = str(message.get("content") or "")
+                    break
+        if final_text:
+            session.add_assistant_message(final_text)
+
+    def _fork_session(self, session: ChatSession, history: str) -> ChatSession:
+        if history == "none":
+            messages = []
+        elif history == "full":
+            messages = session.snapshot()[:-1]
+        else:
+            messages = session.snapshot()[-9:-1]
+        return ChatSession(messages=messages)
 
     def stream_confirm(
         self,
@@ -571,6 +654,7 @@ class SingleToolAgent:
         tool_calls: list[ToolCall],
         mode: AgentMode,
         allow_plan_file_write: bool = False,
+        turn_skill_names: list[str] | None = None,
     ) -> Iterator[AgentEvent | list[dict[str, Any]]]:
         safe_calls, unsafe_calls = self.partition_tool_calls(tool_calls)
         results_by_id: dict[str, dict[str, Any]] = {}
@@ -586,6 +670,8 @@ class SingleToolAgent:
                         tool_call,
                         mode,
                         allow_plan_file_write,
+                        False,
+                        turn_skill_names,
                     )
                     for tool_call in safe_calls
                 }
@@ -606,7 +692,12 @@ class SingleToolAgent:
             if self._cancel_requested:
                 break
             yield ToolStarted(tool_call)
-            result = self._tool_result_for_call(tool_call, mode, allow_plan_file_write)
+            result = self._tool_result_for_call(
+                tool_call,
+                mode,
+                allow_plan_file_write,
+                turn_skill_names=turn_skill_names,
+            )
             result = self._process_tool_result(
                 session,
                 tool_call,
@@ -680,7 +771,20 @@ class SingleToolAgent:
         mode: AgentMode = "normal",
         allow_plan_file_write: bool = False,
         skip_permission: bool = False,
+        turn_skill_names: list[str] | None = None,
     ) -> dict[str, Any]:
+        if self.skill_manager is not None and not self.skill_manager.tool_allowed(tool_call.name, turn_skill_names):
+            return {
+                "ok": False,
+                "content": "",
+                "error": f"Skill tool whitelist blocked tool: {tool_call.name}",
+                "metadata": {
+                    "blocked_by_skill": True,
+                    "tool_name": tool_call.name,
+                    "active_skills": list(self.skill_manager.active_skill_names),
+                    "turn_skills": list(turn_skill_names or []),
+                },
+            }
         try:
             tool = self.registry.get(tool_call.name)
         except ToolError as exc:
@@ -744,10 +848,13 @@ class SingleToolAgent:
         tool_calls: list[ToolCall],
         mode: AgentMode,
         allow_plan_file_write: bool,
+        turn_skill_names: list[str] | None = None,
     ) -> ConfirmationRequired | None:
         if self.permission_checker is None:
             return None
         for tool_call in tool_calls:
+            if self.skill_manager is not None and not self.skill_manager.tool_allowed(tool_call.name, turn_skill_names):
+                continue
             if self._plan_mode_blocks(tool_call, mode, allow_plan_file_write):
                 continue
             try:
@@ -908,8 +1015,15 @@ class SingleToolAgent:
         tool_definitions: list[dict[str, Any]],
         mode: AgentMode,
         model_request_index: int,
+        skill_names: list[str] | None = None,
+        skill_arguments: str = "",
     ) -> PromptPayload:
         overlay_messages = self.memory_manager.overlay_messages() if self.memory_manager is not None else []
+        if self.skill_manager is not None:
+            overlay_messages = [
+                *overlay_messages,
+                *self.skill_manager.overlay_messages(skill_names, arguments=skill_arguments),
+            ]
         payload = assemble_api_payload(
             session_messages=session.snapshot(),
             tools=tool_definitions,
@@ -920,7 +1034,16 @@ class SingleToolAgent:
         )
         if self.memory_manager is not None:
             payload.metadata["memory_context"] = self.memory_manager.status_counts()
+        if self.skill_manager is not None:
+            payload.metadata["active_skills"] = list(self.skill_manager.active_skill_names)
+            payload.metadata["turn_skills"] = list(skill_names or [])
         return payload
+
+    def _tool_definitions_for_skills(self, turn_skill_names: list[str] | None = None) -> list[dict[str, Any]]:
+        definitions = self.registry.list_definitions()
+        if self.skill_manager is None:
+            return definitions
+        return self.skill_manager.filter_tool_definitions(definitions, turn_skill_names)
 
     def _remember_completed_turn(self, session: ChatSession) -> int:
         if self.memory_manager is None:

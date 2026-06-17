@@ -23,7 +23,7 @@ USER_PERMISSIONS_PATH = Path.home() / ".mewcode" / "permissions.yaml"
 PROJECT_PERMISSIONS_PATH = Path(".mewcode") / "permissions.yaml"
 LOCAL_PERMISSIONS_PATH = Path(".mewcode") / "permissions.local.yaml"
 
-READ_TOOLS = {"ReadFile", "Glob", "Grep", "AskUserQuestion", "ListMCPServers"}
+READ_TOOLS = {"ReadFile", "Glob", "Grep", "AskUserQuestion", "ListMCPServers", "ListSkills", "LoadSkill", "ActivateSkill"}
 EDIT_TOOLS = {"WriteFile", "EditFile", "WritePlanFile"}
 UNSAFE_TOOLS = {"WriteFile", "EditFile", "WritePlanFile", "Bash", "ActivateMCPServer"}
 COMMON_ENV_FILENAMES = (".env", ".env.local", ".env.example", ".env.development", ".env.production")

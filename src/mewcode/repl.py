@@ -54,6 +54,7 @@ from mewcode.context import (
 from mewcode.permissions import PERMISSION_MODES, PermissionMode
 from mewcode.providers import ChatProvider, ProviderError, ToolCall
 from mewcode.session import ChatSession
+from mewcode.skills import SkillManager
 
 
 MEWCODE_LOGO = """███╗   ███╗
@@ -1023,6 +1024,7 @@ class MewCodeApp(App[int]):
         cwd: Path | None = None,
         version: str = __version__,
         mcp_status_provider: Callable[[], dict[str, int]] | None = None,
+        skill_manager: SkillManager | None = None,
     ) -> None:
         super().__init__()
         self.provider = provider
@@ -1032,7 +1034,8 @@ class MewCodeApp(App[int]):
         self.cwd = cwd or Path.cwd()
         self.version = version
         self.mcp_status_provider = mcp_status_provider
-        self.command_registry: CommandRegistry = make_builtin_registry()
+        self.skill_manager = skill_manager or getattr(agent, "skill_manager", None)
+        self.command_registry: CommandRegistry = make_builtin_registry(self.skill_manager)
         self.messages: list[DisplayMessage] = []
         self.status_started_at: float | None = None
         self.spinner_index = 0
@@ -1245,7 +1248,12 @@ class MewCodeApp(App[int]):
     def _dispatch_slash_command(self, text: str) -> CommandResult | None:
         return self.command_registry.dispatch(
             text,
-            CommandContext(mode=self.mode, permission_mode=self.permission_mode, registry=self.command_registry),
+            CommandContext(
+                mode=self.mode,
+                permission_mode=self.permission_mode,
+                registry=self.command_registry,
+                skill_manager=self.skill_manager,
+            ),
         )
 
     async def _handle_command_result(self, result: CommandResult, original_text: str) -> None:
@@ -1255,6 +1263,8 @@ class MewCodeApp(App[int]):
             return
         if result.action == "clear":
             self._clear_display()
+            if self.skill_manager is not None:
+                self.skill_manager.clear_active()
             self._append_status_notice("[dim]* Screen cleared[/dim]")
             self.call_after_refresh(self._focus_input)
             return
@@ -1303,8 +1313,15 @@ class MewCodeApp(App[int]):
         if result.action == "memory":
             await self._drive(lambda: self._agent_stream_memory_command(result.command_line), phase="Context")
             return
+        if result.action == "skill":
+            self._append_message(DisplayMessage("assistant", self._handle_skill_command(result.command_line)))
+            self.call_after_refresh(self._focus_input)
+            return
         if result.action == "agent_prompt":
             await self._send_agent_text(result.prompt, display_text=original_text)
+            return
+        if result.action == "skill_prompt":
+            await self._send_skill_text(result.skill_name, result.arguments, display_text=original_text)
             return
 
     async def _send_agent_text(self, text: str, display_text: str | None = None) -> None:
@@ -1317,6 +1334,17 @@ class MewCodeApp(App[int]):
         self._append_message(DisplayMessage("user", display_text or text, active=True))
         self._user_widget = self._last_widget()
         await self._drive(lambda: self._agent_stream_turn(text), phase="Thinking")
+
+    async def _send_skill_text(self, skill_name: str, arguments: str = "", display_text: str | None = None) -> None:
+        if self.agent is None:
+            self._append_message(DisplayMessage("user", display_text or f"/{skill_name} {arguments}".strip(), active=True))
+            self._append_message(DisplayMessage("assistant", "No agent configured."))
+            self._begin_status(error_status_text("No agent configured"), phase=None)
+            self.call_after_refresh(self._focus_input)
+            return
+        self._append_message(DisplayMessage("user", display_text or f"/{skill_name} {arguments}".strip(), active=True))
+        self._user_widget = self._last_widget()
+        await self._drive(lambda: self._agent_stream_skill_command(skill_name, arguments), phase="Thinking")
 
     def _clear_display(self) -> None:
         self.messages.clear()
@@ -1359,7 +1387,20 @@ class MewCodeApp(App[int]):
             )
         else:
             lines.append("- memory: not configured")
+        if self.skill_manager is not None:
+            active = ", ".join(self.skill_manager.active_skill_names) or "(none)"
+            lines.append(f"- skills: {len(self.skill_manager.skills)} loaded, active {active}")
+        else:
+            lines.append("- skills: not configured")
         return "\n".join(lines)
+
+    def _handle_skill_command(self, command_line: str) -> str:
+        if self.skill_manager is None:
+            return "Skill system is not configured."
+        result = self.skill_manager.command_text(command_line)
+        if command_line.strip().lower().startswith("/skill reload"):
+            self.command_registry = make_builtin_registry(self.skill_manager)
+        return result
 
     def _agent_stream_turn(self, text: str) -> Iterator[AgentEvent]:
         if self.agent is None:
@@ -1368,6 +1409,14 @@ class MewCodeApp(App[int]):
             return self.agent.stream_turn(self.session, text, mode=self.mode)
         except TypeError:
             return self.agent.stream_turn(self.session, text)
+
+    def _agent_stream_skill_command(self, skill_name: str, arguments: str = "") -> Iterator[AgentEvent]:
+        if self.agent is None:
+            return iter(())
+        command = getattr(self.agent, "stream_skill_command", None)
+        if command is None:
+            return iter(())
+        return command(self.session, skill_name, arguments, mode=self.mode)
 
     def _agent_stream_compact(self, focus: str = "") -> Iterator[AgentEvent]:
         if self.agent is None:
@@ -1932,6 +1981,7 @@ class MewCodeRepl:
         cwd: Path | None = None,
         version: str = __version__,
         mcp_status_provider: Callable[[], dict[str, int]] | None = None,
+        skill_manager: SkillManager | None = None,
     ) -> None:
         self.provider = provider
         self.config = config
@@ -1942,7 +1992,8 @@ class MewCodeRepl:
         self.cwd = cwd or Path.cwd()
         self.version = version
         self.mcp_status_provider = mcp_status_provider
-        self.command_registry: CommandRegistry = make_builtin_registry()
+        self.skill_manager = skill_manager or getattr(agent, "skill_manager", None)
+        self.command_registry: CommandRegistry = make_builtin_registry(self.skill_manager)
         self.pending_request: PendingToolRequest | None = None
         self.mode = "normal"
         self.permission_mode = config.permission_mode
@@ -1964,6 +2015,7 @@ class MewCodeRepl:
             cwd=self.cwd,
             version=self.version,
             mcp_status_provider=self.mcp_status_provider,
+            skill_manager=self.skill_manager,
         )
         result = app.run()
         return int(result or 0)
@@ -2036,7 +2088,12 @@ class MewCodeRepl:
     def _dispatch_slash_command(self, text: str) -> CommandResult | None:
         return self.command_registry.dispatch(
             text,
-            CommandContext(mode=self.mode, permission_mode=self.permission_mode, registry=self.command_registry),
+            CommandContext(
+                mode=self.mode,
+                permission_mode=self.permission_mode,
+                registry=self.command_registry,
+                skill_manager=self.skill_manager,
+            ),
         )
 
     def _handle_line_command_result(self, result: CommandResult, original_text: str) -> None:
@@ -2044,6 +2101,8 @@ class MewCodeRepl:
             self._println(result.message)
             return
         if result.action == "clear":
+            if self.skill_manager is not None:
+                self.skill_manager.clear_active()
             self._println("\033[2J\033[H* Screen cleared")
             return
         if result.action == "copy":
@@ -2091,8 +2150,14 @@ class MewCodeRepl:
             for event in self._agent_stream_memory_command(result.command_line):
                 self._handle_line_event(event)
             return
+        if result.action == "skill":
+            self._println(self._handle_line_skill_command(result.command_line))
+            return
         if result.action == "agent_prompt":
             self._send_line_agent_text(result.prompt, display_text=original_text)
+            return
+        if result.action == "skill_prompt":
+            self._send_line_skill_text(result.skill_name, result.arguments, display_text=original_text)
 
     def _send_line_agent_text(self, text: str, display_text: str | None = None) -> None:
         if self.agent is None:
@@ -2100,6 +2165,14 @@ class MewCodeRepl:
             return
         self._println(f"> {display_text or text}")
         for event in self._agent_stream_turn(text):
+            self._handle_line_event(event)
+
+    def _send_line_skill_text(self, skill_name: str, arguments: str = "", display_text: str | None = None) -> None:
+        if self.agent is None:
+            self._println("* Error: No agent configured")
+            return
+        self._println(f"> {display_text or f'/{skill_name} {arguments}'.strip()}")
+        for event in self._agent_stream_skill_command(skill_name, arguments):
             self._handle_line_event(event)
 
     def _set_line_permission_mode(self, mode: PermissionMode) -> None:
@@ -2136,7 +2209,20 @@ class MewCodeRepl:
             )
         else:
             lines.append("- memory: not configured")
+        if self.skill_manager is not None:
+            active = ", ".join(self.skill_manager.active_skill_names) or "(none)"
+            lines.append(f"- skills: {len(self.skill_manager.skills)} loaded, active {active}")
+        else:
+            lines.append("- skills: not configured")
         return "\n".join(lines)
+
+    def _handle_line_skill_command(self, command_line: str) -> str:
+        if self.skill_manager is None:
+            return "Skill system is not configured."
+        result = self.skill_manager.command_text(command_line)
+        if command_line.strip().lower().startswith("/skill reload"):
+            self.command_registry = make_builtin_registry(self.skill_manager)
+        return result
 
     def _agent_stream_turn(self, content: str) -> Iterator[AgentEvent]:
         if self.agent is None:
@@ -2145,6 +2231,14 @@ class MewCodeRepl:
             return self.agent.stream_turn(self.session, content, mode=self.mode)
         except TypeError:
             return self.agent.stream_turn(self.session, content)
+
+    def _agent_stream_skill_command(self, skill_name: str, arguments: str = "") -> Iterator[AgentEvent]:
+        if self.agent is None:
+            return iter(())
+        command = getattr(self.agent, "stream_skill_command", None)
+        if command is None:
+            return iter(())
+        return command(self.session, skill_name, arguments, mode=self.mode)
 
     def _agent_stream_compact(self, focus: str = "") -> Iterator[AgentEvent]:
         if self.agent is None:
